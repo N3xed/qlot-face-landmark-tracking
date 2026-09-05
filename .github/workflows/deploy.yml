@@ -5,11 +5,9 @@ name: Deploy paper site to GitHub Pages
 # release (assets qlot-paper.pdf / qlot-supplement.pdf / qlot-final.onnx); figures,
 # thumbnails, and data are built via scripts/site_build.py and the third-party JS
 # via scripts/site_vendor.sh. No build artifacts or model weights are committed.
-#
-# NOTE: set `branches:` to whatever branch you publish from (main / master / website).
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths:
       - "site/**"
       - "scripts/**"
