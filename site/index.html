@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QLOT: Queried Learned Optimization for Face Landmark Tracking</title>
+    <meta name="description" content="QLOT (Queried Learned Optimization for Face Landmark Tracking): efficient jitter-free tracking through canonical query points, localized correlations, and learned recurrent optimization. Includes an in-browser ONNX webcam/video demo with a 3D query editor." />
+    <link rel="stylesheet" href="./css/app.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "three/addons/": "./vendor/three/addons/"
+        }
+      }
+    </script>
+    <script src="./vendor/ort/ort.all.min.js"></script>
+  </head>
+  <body>
+    <header class="hero">
+      <h1>QLOT: Queried Learned Optimization for Face Landmark Tracking</h1>
+      <p class="hero-sub">Efficient jitter-free tracking through canonical query points, localized correlations, and learned recurrent optimization.</p>
+      <div class="hero-actions">
+        <a class="btn" href="assets/qlot-paper.pdf" target="_blank" rel="noopener">Read the paper</a>
+        <a class="btn" href="assets/qlot-supplement.pdf" target="_blank" rel="noopener">Supplement</a>
+        <a class="btn btn-primary" href="#demo">Try the live demo</a>
+      </div>
+    </header>
+
+    <main>
+      <!-- ===================== Showcase ===================== -->
+      <section class="showcase" id="showcase">
+        <div class="showcase-grid">
+          <div class="abstract">
+            <div class="abstract-title">Abstract</div>
+            <p>Facial landmark detection is a mature field, with tracking approaches capable of real-time inference on mobile devices. Yet most applications treat tracking as a post-processing problem, applying classical filters for jitter suppression. We propose QLOT (Queried Learned Optimization for Tracking), which treats face alignment as an iterative, query-conditioned learned optimization process rather than single-shot inference. Incorporating ideas from RAFT, a recurrent optical flow estimator, QLOT fuses per-landmark correlation features with temporal context carried by a recurrent hidden state, exchanged across landmarks through a low-rank Write-Mix-Read block. A composite objective of decoupled spatial and temporal Gaussian negative log-likelihood terms supervises directional uncertainty and the temporal derivatives of the error. QLOT achieves competitive accuracy to the state-of-the-art while improving temporal stability, staying efficient enough for real-time mobile deployment (2M parameters, 0.65G MACs/frame). To evaluate tracking, we generalize Normalized Mean Flicker to a multi-timescale stability profile based on the Allan variance.</p>
+          </div>
+          <div class="pdfs">
+            <a class="pdf" href="assets/qlot-paper.pdf" target="_blank" rel="noopener">
+              <img src="assets/thumb_paper.png" alt="Paper thumbnail" loading="lazy" />
+              <div class="pdf-body">
+                <div class="pdf-title">Paper</div>
+                <div class="pdf-sub">10-page article · PDF</div>
+              </div>
+            </a>
+            <a class="pdf" href="assets/qlot-supplement.pdf" target="_blank" rel="noopener">
+              <img src="assets/thumb_supplement.png" alt="Supplementary material thumbnail" loading="lazy" />
+              <div class="pdf-body">
+                <div class="pdf-title">Supplementary Material</div>
+                <div class="pdf-sub">8 pages · PDF</div>
+              </div>
+            </a>
+          </div>
+        </div>
+
+        <div class="figure-block">
+          <div class="figure-title">Architecture</div>
+          <div class="figure-row">
+            <figure class="figure figure-model">
+              <img src="assets/model.svg" alt="QLOT model diagram" loading="lazy" />
+              <figcaption class="figure-cap">The QLOT architecture. Green components do not contain learned parameters. Most activation functions are omitted for clarity.</figcaption>
+            </figure>
+            <figure class="figure figure-wmr">
+              <img src="assets/update_prediction.svg" alt="Write-Mix-Read block" loading="lazy" />
+              <figcaption class="figure-cap">Write-Mix-Read block for spatio-temporal fusion.</figcaption>
+            </figure>
+          </div>
+        </div>
+
+        <div class="results-block">
+          <div class="figure-title">Results</div>
+          <div class="results-row">
+            <div class="results-table-wrap">
+              <table class="results-table">
+                <colgroup>
+                  <col class="c-method" />
+                  <col class="c-params" />
+                  <col class="c-macs" />
+                  <col class="c-300" />
+                  <col class="c-300" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-wflw" />
+                  <col class="c-synth" />
+                  <col class="c-v" />
+                  <col class="c-v" />
+                  <col class="c-nmf" />
+                  <col class="c-nmf" />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th rowspan="2">Method, Year</th>
+                    <th rowspan="2">Params</th>
+                    <th rowspan="2">MACs</th>
+                    <th class="sep" colspan="2">300-W (NME)</th>
+                    <th class="sep" colspan="7">WFLW (NME)</th>
+                    <th class="sep">Synth</th>
+                    <th class="sep" colspan="4">WFLW-V</th>
+                  </tr>
+                  <tr>
+                    <th class="sep">Com</th>
+                    <th>Chal</th>
+                    <th class="sep">Full</th>
+                    <th>Pose</th>
+                    <th>Expr</th>
+                    <th>Ill</th>
+                    <th>Mkp</th>
+                    <th>Occl</th>
+                    <th>Blur</th>
+                    <th class="sep">NME</th>
+                    <th class="sep">NME<sub>E</sub></th>
+                    <th>NME<sub>H</sub></th>
+                    <th>NMF<sub>E</sub></th>
+                    <th>NMF<sub>H</sub></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>RwR, 2023</td>
+                    <td>21.8 M</td>
+                    <td>–</td>
+                    <td class="sep">–</td>
+                    <td>–</td>
+                    <td class="sep best">3.92</td>
+                    <td>6.86</td>
+                    <td class="best">3.94</td>
+                    <td>4.17</td>
+                    <td class="best">3.75</td>
+                    <td>4.77</td>
+                    <td>4.59</td>
+                    <td class="sep">–</td>
+                    <td class="sep">1.24</td>
+                    <td>2.30</td>
+                    <td>82.74</td>
+                    <td>172.95</td>
+                  </tr>
+                  <tr>
+                    <td>Inf3DLmks, 2024</td>
+                    <td>&gt;100 M*</td>
+                    <td>–</td>
+                    <td class="sep">2.89</td>
+                    <td>5.71</td>
+                    <td class="sep">–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td class="sep">–</td>
+                    <td class="sep">–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                  </tr>
+                  <tr>
+                    <td>TUFA, 2025</td>
+                    <td>36.0 M</td>
+                    <td>17.6 G</td>
+                    <td class="sep best">2.59</td>
+                    <td class="best">4.45</td>
+                    <td class="sep">3.93</td>
+                    <td class="best">6.48</td>
+                    <td>4.11</td>
+                    <td class="best">3.82</td>
+                    <td>3.81</td>
+                    <td class="best">4.68</td>
+                    <td class="best">4.53</td>
+                    <td class="sep">–</td>
+                    <td class="sep">–</td>
+                    <td>–</td>
+                    <td>–</td>
+                    <td>–</td>
+                  </tr>
+                  <tr>
+                    <td>QLOT-final (ours)</td>
+                    <td class="best">1.98 M</td>
+                    <td class="best">0.65 G</td>
+                    <td class="sep">3.03</td>
+                    <td>5.37</td>
+                    <td class="sep">3.93</td>
+                    <td>6.65</td>
+                    <td>4.07</td>
+                    <td>3.88</td>
+                    <td>3.90</td>
+                    <td>4.75</td>
+                    <td>4.60</td>
+                    <td class="sep">1.62</td>
+                    <td class="sep best">0.83</td>
+                    <td class="best">1.30</td>
+                    <td class="best">77.7</td>
+                    <td class="best">138.5</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div class="results-caption">
+                Comparison with published face-landmark methods. Static NME (%, inter-ocular) on 300-W, WFLW, and FaceSynthetics (%, face-size). WFLW-V video NME (%, face-size) and NMF on our test split (easy, hard), each video truncated to 120 frames.
+                MACs (Multiply-Accumulate operations) are the per-frame tracking cost. [–] = not reported. *Estimated from paper.
+              </div>
+            </div>
+            <figure class="figure results-figure">
+              <img src="assets/fig_annotated_samples.png" alt="Qualitative results with predicted 95% confidence ellipses" loading="lazy" />
+              <figcaption class="figure-cap">Qualitative results with predicted 95% confidence ellipses.</figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===================== Demo ===================== -->
+    <section class="demo" id="demo">
+      <div class="wrap-wide">
+        <div class="section-title">
+          <h2>Live In-Browser Demo</h2>
+          <p>Edit queries on the 3D mesh, then track a face from your webcam or a video file.</p>
+          <p class="demo-disclaimer">Inference runs on single-threaded WebAssembly (WebGPU seems to always fall back to CPU, so disabled). See runtime graphs in the supplement for the true inference time.</p>
+        </div>
+
+        <div class="demo-grid">
+          <!-- Left: 3D query editor -->
+          <div class="panel mesh-panel">
+            <div class="panel-head">
+              <span>Query Editor</span>
+              <span class="panel-sub" id="query-count">0 pts</span>
+            </div>
+            <div class="mesh-toolbar">
+              <div class="row" style="margin-bottom:8px">
+                <label class="field-label" for="preset-select" style="min-width:auto;margin-bottom:0">Preset</label>
+                <select id="preset-select">
+                  <option value="wflw_98">WFLW · 98</option>
+                  <option value="synth_70">FaceSynth · 70</option>
+                  <option value="ibug_68">300-W · 68</option>
+                </select>
+              </div>
+              <div class="mode-btns" id="mode-btns">
+                <button class="btn active" id="btn-add" aria-pressed="true">Add</button>
+                <button class="btn" id="btn-move">Move</button>
+                <button class="btn" id="btn-del">Delete</button>
+              </div>
+              <div class="row">
+                <button class="btn" id="btn-clear">Clear</button>
+                <button class="btn" id="btn-resetview">Reset view</button>
+                <button class="btn active" id="btn-send-queries" aria-pressed="true">Send to model</button>
+              </div>
+              <div class="mesh-legend-row">
+                <div class="mesh-legend" id="mesh-legend"></div>
+                <div class="drag drag-legend" id="mesh-radius" data-type="float" data-value="1" data-min="0.5" data-max="10" data-decimals="1" data-step="0.1" data-suffix="×" data-label="Query point radius"></div>
+              </div>
+              <div id="mesh3d-status" class="panel-sub"></div>
+            </div>
+            <div class="mesh-view" id="mesh3d"></div>
+          </div>
+
+          <!-- Middle: video / overlay -->
+          <div class="panel video-panel">
+            <div class="panel-head">
+              <span>Live Tracking</span>
+              <div class="panel-head-actions">
+                <button class="btn" id="btn-webcam">Start webcam</button>
+                <button class="btn btn-primary hidden" id="btn-stop">Stop</button>
+                <button class="btn" id="btn-file">Load video</button>
+                <button class="btn hidden" id="btn-playpause">Pause</button>
+                <input type="file" id="file-input" accept="video/*" hidden />
+              </div>
+            </div>
+            <div class="video-view">
+              <video id="video" muted playsinline style="display:none"></video>
+              <canvas id="video-canvas"></canvas>
+              <canvas id="video-overlay"></canvas>
+            </div>
+            <div class="video-hint">Webcam needs a secure context (HTTPS or localhost).</div>
+            <div class="video-error" id="webcam-error"></div>
+          </div>
+
+          <!-- Right: settings -->
+          <div class="panel settings-panel">
+            <div class="panel-head"><span>Settings</span></div>
+            <div class="panel-body">
+              <div class="settings-group">
+                <div class="settings-group-title">Model</div>
+                <div class="field">
+                  <button class="btn" id="btn-model">Load ONNX…</button>
+                  <input type="file" id="model-file" accept=".onnx" hidden />
+                  <span class="panel-sub" id="model-status">default: qlot-final.onnx</span>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-title">Inference</div>
+                <div class="field">
+                  <label class="field-label">Iterations</label>
+                  <div class="drag" id="in-iter" data-type="int" data-value="1" data-min="1" data-max="8" data-label="Iterations"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Gating radius</label>
+                  <div class="drag" id="in-radius" data-type="float" data-value="0.5" data-min="0" data-max="2" data-decimals="2" data-label="Gating radius"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Gating cutoff</label>
+                  <div class="drag" id="in-cutoff" data-type="float" data-value="0.05" data-min="0" data-max="1" data-decimals="2" data-label="Gating cutoff"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="in-fhidden">Forward hidden state</label>
+                  <input type="checkbox" id="in-fhidden" checked />
+                </div>
+                <div class="field">
+                  <label class="field-label" for="in-fpreds">Forward predictions</label>
+                  <input type="checkbox" id="in-fpreds" checked />
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-title">Crop &amp; Tracking</div>
+                <div class="field">
+                  <label class="field-label" for="auto-follow">Auto-follow</label>
+                  <input type="checkbox" id="auto-follow" checked />
+                </div>
+                <div class="field">
+                  <label class="field-label">Crop size</label>
+                  <div class="drag" id="crop-size" data-type="int" data-value="128" data-min="30" data-max="480" data-label="Crop size"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Crop X</label>
+                  <div class="drag" id="crop-x" data-type="int" data-value="0" data-min="0" data-max="600" data-label="Crop X"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Crop Y</label>
+                  <div class="drag" id="crop-y" data-type="int" data-value="0" data-min="0" data-max="400" data-label="Crop Y"></div>
+                </div>
+                <button class="btn" id="btn-recenter" style="margin-top:6px">Center &amp; relock</button>
+                <details style="margin-top:8px">
+                  <summary class="panel-sub" style="cursor:pointer">Advanced tracker params</summary>
+                  <div class="field" style="margin-top:8px"><label class="field-label">Min size</label><div class="drag" id="t-minsize" data-type="int" data-value="30" data-min="8" data-max="256" data-label="Min size"></div></div>
+                  <div class="field"><label class="field-label">Max velocity</label><div class="drag" id="t-maxvel" data-type="int" data-value="40" data-min="1" data-max="500" data-label="Max velocity"></div></div>
+                  <div class="field"><label class="field-label">Max size velocity</label><div class="drag" id="t-maxsizevel" data-type="int" data-value="20" data-min="1" data-max="256" data-label="Max size velocity"></div></div>
+                  <div class="field"><label class="field-label">Smooth translation</label><div class="drag" id="t-smooth-trans" data-type="float" data-value="0.12" data-min="0" data-max="1" data-decimals="2" data-label="Smooth translation"></div></div>
+                  <div class="field"><label class="field-label">Smooth size</label><div class="drag" id="t-smooth-size" data-type="float" data-value="0.12" data-min="0" data-max="1" data-decimals="2" data-label="Smooth size"></div></div>
+                  <div class="field"><label class="field-label">Velocity EMA α</label><div class="drag" id="t-vel-ema" data-type="float" data-value="0.4" data-min="0" data-max="1" data-decimals="2" data-label="Velocity EMA alpha"></div></div>
+                  <div class="field"><label class="field-label">Tracking lost var</label><div class="drag" id="t-lost-var" data-type="int" data-value="80" data-min="0" data-max="500" data-label="Tracking lost variance"></div></div>
+                  <div class="field"><label class="field-label">Variance EMA α</label><div class="drag" id="t-var-ema" data-type="float" data-value="0.5" data-min="0" data-max="1" data-decimals="2" data-label="Variance EMA alpha"></div></div>
+                  <div class="field"><label class="field-label">Lost grace period</label><div class="drag" id="t-lost-grace" data-type="int" data-value="60" data-min="0" data-max="600" data-label="Lost grace period"></div></div>
+                  <div class="field"><label class="field-label">Lost smooth trans</label><div class="drag" id="t-lost-smooth" data-type="float" data-value="0.05" data-min="0" data-max="1" data-decimals="2" data-label="Lost smooth translation"></div></div>
+                  <div class="field"><label class="field-label">Margin ratio</label><div class="drag" id="t-margin" data-type="float" data-value="0.12" data-min="0" data-max="1" data-decimals="2" data-label="Margin ratio"></div></div>
+                </details>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-title">Display</div>
+                <div class="field">
+                  <label class="field-label">Cross size</label>
+                  <div class="drag" id="d-cross" data-type="int" data-value="3" data-min="1" data-max="12" data-label="Cross size"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Landmark size</label>
+                  <div class="drag" id="d-pointscale" data-type="float" data-value="1" data-min="0.5" data-max="4" data-decimals="2" data-label="Landmark size"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label">Box width</label>
+                  <div class="drag" id="d-bbox" data-type="float" data-value="1" data-min="1" data-max="4" data-decimals="2" data-label="Box width"></div>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="d-ellipses">Show covariance ellipses</label>
+                  <input type="checkbox" id="d-ellipses" />
+                </div>
+                <div class="field">
+                  <label class="field-label" for="d-cropbox">Draw crop box</label>
+                  <input type="checkbox" id="d-cropbox" checked />
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-title">Status</div>
+                <div class="stat-row"><span class="stat-label">Source</span><span class="stat-value" id="st-source">no source</span></div>
+                <div class="stat-row"><span class="stat-label">Provider</span><span class="stat-value" id="st-provider">—</span></div>
+                <div class="stat-row"><span class="stat-label">FPS</span><span class="stat-value" id="st-fps">—</span></div>
+                <div class="stat-row"><span class="stat-label">Infer</span><span class="stat-value" id="st-ms">—</span></div>
+                <div class="stat-row"><span class="stat-label">Tracker</span><span class="stat-value state" id="st-state">—</span></div>
+                <div class="stat-row"><span class="stat-label">Variance</span><span class="stat-value" id="st-var">—</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <canvas id="crop-canvas" width="224" height="224" style="display:none"></canvas>
+    <noscript><p style="text-align:center;padding:20px">This demo requires JavaScript.</p></noscript>
+
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>

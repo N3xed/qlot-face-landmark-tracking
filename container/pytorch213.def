@@ -1,0 +1,51 @@
+Bootstrap: docker
+# CUDA 12.6 base, required because CUDA 13 dropped sm_70 (V100 / CC 7.0) support.
+# The cu126 torch wheels still include V100 kernels.
+From: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+
+%post
+    # Avoid interactive prompts (e.g. tzdata) during apt installs
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Update packages and install base tools
+    # build-essential provides gcc/g++, required by Triton to JIT-compile CUDA kernels
+    apt-get update -y
+    apt-get install -y software-properties-common curl tmux build-essential tmux ffmpeg
+
+    # Ubuntu 22.04 ships Python 3.10; the project requires >=3.12 (pyproject.toml).
+    # Install Python 3.12 from the deadsnakes PPA.
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -y
+    apt-get install -y python3.12 python3.12-dev python3.12-venv
+
+    # Make python3.12 the default python3/python
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+    # Install pip for python3.12
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3.12
+
+    # Make pip3.12 the default pip/pip3
+    update-alternatives --install /usr/bin/pip3 pip3 /usr/local/bin/pip3.12 1
+    update-alternatives --install /usr/bin/pip pip /usr/local/bin/pip3.12 1
+
+    # Global flag to bypass the externally managed environment error
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+
+    # Install PyTorch 2.13 compiled for CUDA 12.6 (includes sm_70 / V100 kernels)
+    pip install torch==2.13.0 torchvision torchaudio numpy tqdm --index-url https://download.pytorch.org/whl/cu126
+    pip install 'albumentations==2.0.8' jupyterlab ipykernel 'kornia==0.8.2' 'timm==1.0.26' tensorboard 'setuptools==81.0.0' 'opencv-python-headless>=4.13.0.92' matplotlib 'pyvista>=0.47.1' rich torchinfo 'ffmpeg-python>=0.2.0'
+
+%environment
+    # Set standard CUDA binary paths
+    export PATH=/usr/local/cuda/bin:$PATH
+    
+    # Add the standard CUDA libraries
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+    # Global flag to bypass the externally managed environment error for pip
+    export PIP_BREAK_SYSTEM_PACKAGES=1
+
+%runscript
+    # Default execution command
+    python "$@"

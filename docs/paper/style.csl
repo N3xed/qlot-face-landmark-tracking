@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xcsl/1.0" class="in-text" version="1.0" default-locale="en-US">
+  <info>
+    <title>Conference Numeric Full-Name References</title>
+    <title-short>conf-numeric</title-short>
+    <id>conf-numeric-fullname</id>
+    <summary>
+      Numeric style matching ieeenat_fullname.bst from the CVPR
+      author kit: full author names, sentence-case titles, "In Venue, pages,
+      year." for proceedings, "Journal, vol(num):pages, year." for articles,
+      "arXiv preprint arXiv:NNNN.NNNNN, year." for preprints. References are
+      numbered in citation order. No DOI/URL clutter.
+    </summary>
+    <category citation-format="numeric"/>
+    <category field="generic-base"/>
+    <updated>2026-08-26T00:00:00+00:00</updated>
+    <rights license="http://creativecommons.org/licenses/by-sa/3.0/">This work is licensed under a Creative Commons Attribution-ShareAlike 3.0 License</rights>
+  </info>
+
+  <macro name="author">
+    <names variable="author">
+      <name form="long" initialize="false" and="text" delimiter=", " delimiter-precedes-last="contextual"/>
+      <substitute>
+        <text macro="editor"/>
+      </substitute>
+    </names>
+  </macro>
+
+  <macro name="editor">
+    <names variable="editor">
+      <name form="long" initialize="false" and="text" delimiter=", " delimiter-precedes-last="contextual"/>
+    </names>
+  </macro>
+
+  <macro name="title">
+    <text variable="title" text-case="sentence"/>
+  </macro>
+
+  <macro name="year">
+    <date variable="issued">
+      <date-part name="year"/>
+    </date>
+  </macro>
+
+  <!-- Journal, 12(1):234-778 -->
+  <macro name="journal">
+    <group delimiter=", ">
+      <text variable="container-title" font-style="italic"/>
+      <group delimiter=":">
+        <group>
+          <text variable="volume"/>
+          <text variable="issue" prefix="(" suffix=")"/>
+        </group>
+        <text variable="page"/>
+      </group>
+    </group>
+  </macro>
+
+  <!-- In Booktitle, pages 234-778 -->
+  <macro name="proceedings">
+    <group delimiter=", ">
+      <group delimiter=" ">
+        <text term="in" text-case="capitalize-first"/>
+        <text variable="container-title" font-style="italic"/>
+      </group>
+      <group delimiter=" ">
+        <label variable="page" form="long"/>
+        <text variable="page"/>
+      </group>
+    </group>
+  </macro>
+
+  <!-- "arXiv preprint arXiv:2006.10962" is stored in the note field, since
+       hayagriva does not expose eprint/archivePrefix to CSL variables. -->
+  <macro name="venue">
+    <choose>
+      <if type="article-journal article-magazine article-newspaper" match="any">
+        <text macro="journal"/>
+      </if>
+      <else-if type="paper-conference chapter" match="any">
+        <text macro="proceedings"/>
+      </else-if>
+      <else-if type="thesis" match="any">
+        <group delimiter=", ">
+          <text variable="genre"/>
+          <text variable="publisher"/>
+        </group>
+      </else-if>
+      <else-if type="book" match="any">
+        <text variable="publisher"/>
+      </else-if>
+      <else-if variable="note" match="any">
+        <text variable="note"/>
+      </else-if>
+      <else-if variable="URL" match="any">
+        <text variable="URL"/>
+      </else-if>
+    </choose>
+  </macro>
+
+  <citation>
+    <sort>
+      <key variable="citation-number"/>
+    </sort>
+    <layout prefix="[" suffix="]" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+
+  <bibliography entry-spacing="0" line-spacing="1" second-field-align="flush" et-al-min="10" et-al-use-first="6">
+    <sort>
+      <key variable="citation-number"/>
+    </sort>
+    <layout suffix=".">
+      <text variable="citation-number" prefix="[" suffix="]"/>
+      <group delimiter=". ">
+        <text macro="author"/>
+        <text macro="title"/>
+        <group delimiter=", ">
+          <text macro="venue"/>
+          <text macro="year"/>
+        </group>
+      </group>
+    </layout>
+  </bibliography>
+</style>

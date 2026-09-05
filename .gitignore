@@ -1,0 +1,12 @@
+docs/journal/*.pdf
+docs/thesis/*.pdf
+docs/**/main.pdf
+.venv
+.venv-*
+.cache
+__pycache__
+src/*.ini
+*.sif
+
+# Model weights are attached to a GitHub release, not committed.
+models/

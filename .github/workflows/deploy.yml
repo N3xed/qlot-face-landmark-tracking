@@ -1,0 +1,96 @@
+name: Deploy paper site to GitHub Pages
+
+# Publishes site/ (as the site root) to GitHub Pages.
+# The paper + supplement PDFs and the ONNX model are pulled from the latest GitHub
+# release (assets qlot-paper.pdf / qlot-supplement.pdf / qlot-final.onnx); figures,
+# thumbnails, and data are built via scripts/site_build.py and the third-party JS
+# via scripts/site_vendor.sh. No build artifacts or model weights are committed.
+#
+# NOTE: set `branches:` to whatever branch you publish from (main / master / website).
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "site/**"
+      - "scripts/**"
+      - "data/**"
+      - "docs/paper/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install poppler-utils (pdftoppm)
+        run: sudo apt-get update -y && sudo apt-get install -y poppler-utils
+
+      - name: Install Typst (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/typst/typst/releases/download/v0.15.1/typst-x86_64-unknown-linux-musl.tar.xz -o /tmp/typst.tar.xz
+          sudo tar -xJf /tmp/typst.tar.xz -C /usr/local/bin
+          typst --version
+
+      - name: Download paper + supplement PDFs and model from latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+          rel="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api")"
+          # Exact asset names; a missing asset yields an empty URL and fails the step.
+          paper_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-paper.pdf") | .browser_download_url // empty')"
+          supp_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-supplement.pdf") | .browser_download_url // empty')"
+          model_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-final.onnx") | .browser_download_url // empty')"
+          if [ -z "$paper_url" ] || [ -z "$supp_url" ] || [ -z "$model_url" ]; then
+            echo "::error::Latest release is missing qlot-paper.pdf, qlot-supplement.pdf, and/or qlot-final.onnx"
+            exit 1
+          fi
+          mkdir -p docs/paper models
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o docs/paper/paper.pdf "$paper_url"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o docs/paper/supplement.pdf "$supp_url"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o models/qlot-final.onnx "$model_url"
+          ls -la docs/paper/paper.pdf docs/paper/supplement.pdf models/qlot-final.onnx
+
+      - name: Vendor third-party JS (three.js + onnxruntime-web)
+        run: bash scripts/site_vendor.sh
+
+      - name: Build site assets
+        run: python3 scripts/site_build.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
