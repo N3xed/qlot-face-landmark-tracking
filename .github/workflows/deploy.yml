@@ -55,20 +55,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
-          rel="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api")"
-          # Exact asset names; a missing asset yields an empty URL and fails the step.
-          paper_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-paper.pdf") | .browser_download_url // empty')"
-          supp_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-supplement.pdf") | .browser_download_url // empty')"
-          model_url="$(printf '%s' "$rel" | jq -r '.assets[] | select(.name=="qlot-final.onnx") | .browser_download_url // empty')"
-          if [ -z "$paper_url" ] || [ -z "$supp_url" ] || [ -z "$model_url" ]; then
-            echo "::error::Latest release is missing qlot-paper.pdf, qlot-supplement.pdf, and/or qlot-final.onnx"
-            exit 1
-          fi
           mkdir -p docs/paper models
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o docs/paper/paper.pdf "$paper_url"
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o docs/paper/supplement.pdf "$supp_url"
-          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -o models/qlot-final.onnx "$model_url"
+          gh release download --repo "$GITHUB_REPOSITORY" --clobber \
+            --pattern qlot-paper.pdf --pattern qlot-supplement.pdf \
+            --pattern qlot-final.onnx --dir /tmp/release-assets
+          mv /tmp/release-assets/qlot-paper.pdf docs/paper/paper.pdf
+          mv /tmp/release-assets/qlot-supplement.pdf docs/paper/supplement.pdf
+          mv /tmp/release-assets/qlot-final.onnx models/qlot-final.onnx
           ls -la docs/paper/paper.pdf docs/paper/supplement.pdf models/qlot-final.onnx
 
       - name: Vendor third-party JS (three.js + onnxruntime-web)
