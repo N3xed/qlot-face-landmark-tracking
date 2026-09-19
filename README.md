@@ -1,7 +1,7 @@
 # QLOT: Queried Learned Optimization for Face Landmark Tracking
 
 QLOT treats face alignment as an iterative, query-conditioned learned optimization
-process rather than single-shot inference. Inspired by RAFT, QLOT fuses per-landmark correlation features with temporal context carried
+process rather than single-shot inference. Inspired by [RAFT](https://arxiv.org/abs/2003.12039), QLOT fuses per-landmark correlation features with temporal context carried
 by a recurrent hidden state, exchanged across landmarks through a low-rank
 Write-Mix-Read block. A composite objective of decoupled spatial and temporal Gaussian
 negative log-likelihood terms supervises directional uncertainty and the temporal
@@ -12,7 +12,8 @@ substantially improving temporal stability, and staying
 efficient enough for real-time mobile deployment (2M parameters and 0.65G MACs/frame).
 
 Runtime (224×224 input, ONNX Runtime): ~2 ms/frame on an NVIDIA RTX 3080 (CUDA), ~8 ms
-on CPU (1 frame, 1 iteration, 98 landmarks).
+on CPU (1 frame, 1 iteration, 98 landmarks). It is recommended to use Graph Capture, since
+the inference time is dominated by kernel launches (many small kernels).
 
 See the [Project Page](https://n3xed.github.io/qlot-face-landmark-tracking/) for more details and a local web
 demo running on single-threaded WebAssembly.
@@ -21,17 +22,17 @@ demo running on single-threaded WebAssembly.
 
 ```
 src/            Training, evaluation, demo, and ONNX export code
-  model/        Model definition (feature extractor, detector, update predictor, covariance)
-  kernels/      Fused Triton kernel for correlation sampling (only used for training)
+  model/        Model definition (feature extractor, detector, update predictor, covariance, ...)
+  kernels/      Fused Conv2D+GridSample Triton kernel (only for training)
   utils/        Dataset loaders, training utilities, visualization
   notebooks/    Evaluation and exploration notebooks
-data/           Canonical landmark layouts and query-point presets (no dataset images)
+data/           Canonical landmark layouts and query-point presets
 docs/paper/     Paper and supplementary material source (Typst)
-site/           Interactive browser demo (assets built by CI)
+site/           Interactive browser demo
 scripts/        Site asset build (site_build.py) and JS vendoring (site_vendor.sh)
 results/        Figure-generation and claim-verification scripts
 container/      Apptainer/Singularity definitions for the training environment
-ABLATIONS.md    Pre-specified ablation matrix and results
+ABLATIONS.md    Pre-specified ablation matrix
 ```
 
 ## Setup
@@ -43,18 +44,17 @@ uv sync
 ```
 
 The default environment targets CUDA 13 (`torch==2.13.0+cu130` via the PyTorch wheel
-index; see `pyproject.toml`). Alternatively, use the container definitions in
+index, see `pyproject.toml`). Alternatively, use the container definitions in
 `container/` for a fully pinned training environment.
 
 ## Pretrained models
 
-Model weights are attached to the [latest GitHub release](https://github.com/N3xed/qlot-face-landmark-tracking/releases/latest)
-(not committed to the repository):
+Model weights are attached to the [latest GitHub release](https://github.com/N3xed/qlot-face-landmark-tracking/releases/latest):
 
 | Asset | Format | Use |
 |---|---|---|
-| `qlot-final.pth` | PyTorch checkpoint | demo, evaluation, fine-tuning |
-| `qlot-final.onnx` | ONNX | export / the browser demo |
+| `qlot-final.pth` | PyTorch checkpoint (ablation 4, seed 2) | demo, evaluation, fine-tuning |
+| `qlot-final.onnx` | ONNX | export / inference |
 | `qlot-paper.pdf`, `qlot-supplement.pdf` | PDF | paper and supplementary material |
 
 ## Usage
@@ -75,14 +75,15 @@ Full evaluation results and models for all ablations and seeds are available at 
 
 Datasets (300-W, WFLW, WFLW-V, FaceSynthetics) are **not** included.
 They are subject to their own licenses and must be obtained from their respective sources
-(the download links contained in the Python sources are not guaranteed to work).
-The canonical landmark layouts used for training and evaluation are provided in `data/`.
+(the download links contained in the Python sources may or may not work).
+Canonical landmark layouts used for training and evaluation are provided in `data/`.
 
 **ONNX export**:
 
 ```bash
 uv run src/export_onnx.py qlot-final.pth
 ```
+(Note: The exported `qlot-final.onnx` model was further simplified by [`onnxsim`](https://github.com/onnxsim/onnxsim)).
 
 **Training**: `src/train.py` (see `uv run src/train.py --help`, requires the datasets
 and a CUDA GPU with Triton support for the fused kernels).
