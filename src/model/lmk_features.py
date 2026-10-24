@@ -10,121 +10,164 @@ import torch.nn.functional as F
 @dataclass
 class SampleGrid:
     grid: torch.Tensor
-    scale: float | torch.Tensor
 
 
-_GRID_CACHE = {}
+class LocalPatchSampler(nn.Module):
 
+    _GRID_CACHE = {}
 
-def get_cached_grid(
-    sample_res: int,
-    H: int,
-    W: int,
-    kernel_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    keep=10,
-) -> SampleGrid:
-    """
-    Get a cached sampling grid for given sample resolution and feature map size.
+    def __init__(self, map_channels: list[int], sample_res: int = 3):
+        super().__init__()
 
-    Args:
-        sample_res: Resolution of the sample grid (e.g., 3 for 3x3 patches).
-        H: Height of the feature map of the backbone.
-        W: Width of the feature map of the backbone.
-        kernel_size: Size of the kernel to determine scale.
-        device: Device to create the grid on.
-        dtype: Data type of the grid.
-        keep: Number of cached grids to keep.
-    Returns:
-        A sample grid object with grid of shape (sample_res, sample_res, 2) in normalized [-1, 1] coordinates.
-    """
+        self.sample_res = sample_res
 
-    # Assume same scale for (sample_res, H, W)
-    key = (sample_res, H, W, device, dtype)
-    if key in _GRID_CACHE:
-        # Move to end to show it was recently used
-        val = _GRID_CACHE.pop(key)
-        _GRID_CACHE[key] = val
+        self.convs = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Flatten(0, 1),  # Flatten batch and query dimension
+                    nn.Conv2d(in_channels=c, out_channels=c, kernel_size=sample_res, padding=0, groups=c)
+                )
+                for c in map_channels
+            ]
+        )
+
+        with torch.no_grad():
+            for c in self.convs:
+                assert isinstance(c, nn.Sequential)
+                conv = c[1]
+                assert isinstance(conv, nn.Conv2d)
+                init(conv, nonlinearity="linear")
+                conv.weight.div_(2.0)
+                conv.weight[:, :, sample_res // 2, sample_res // 2] = 1.0
+
+    def forward(self, feature_maps: list[torch.Tensor], coords: torch.Tensor) -> list[torch.Tensor]:
+        """
+        Sample local patches from feature maps around the given coordinates,
+        and apply depthwise convolutions to aggregate the local patches into feature vectors.
+
+        Args:
+            feature_maps: List of feature maps to sample from, each with shape (batch_size, C_i, H_i, W_i).
+            coords: 2D query points in normalized [-1, 1] coordinates, shape (batch_size, num_queries, 2).
+
+        Returns:
+            List of sampled features, each with shape (batch_size, num_queries, C_i).
+        """
+        
+        batch_size, num_queries, _ = coords.shape
+        grids = [
+            self.get_cached_grid(
+                sample_res=self.sample_res,
+                H=feat_map.shape[-2],
+                W=feat_map.shape[-1],
+                device=feat_map.device,
+                dtype=feat_map.dtype,
+            )
+            for feat_map in feature_maps
+        ]
+
+        samples = self.lookup_grid(coords, feature_maps, grids)  # (batch_size, num_queries, C_i, res_h, res_w)
+        samples = [
+            conv(sample).view(batch_size, num_queries, -1) for conv, sample in zip(self.convs, samples)
+        ]  # each (batch_size, num_queries, C_i)
+
+        return samples
+
+    @classmethod
+    def get_cached_grid(
+        cls,
+        sample_res: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        keep=10,
+    ) -> SampleGrid:
+        """
+        Get a cached sampling grid for given sample resolution and feature map size.
+
+        Args:
+            sample_res: Resolution of the sample grid (e.g., 3 for 3x3 patches).
+            H: Height of the feature map of the backbone.
+            W: Width of the feature map of the backbone.
+            device: Device to create the grid on.
+            dtype: Data type of the grid.
+            keep: Number of cached grids to keep.
+        Returns:
+            A sample grid object with grid of shape (sample_res, sample_res, 2) in normalized [-1, 1] coordinates.
+        """
+
+        # Assume same scale for (sample_res, H, W)
+        key = (sample_res, H, W, device, dtype)
+        if key in cls._GRID_CACHE:
+            # Move to end to show it was recently used
+            val = cls._GRID_CACHE.pop(key)
+            cls._GRID_CACHE[key] = val
+            return val
+
+        assert H > 1 and W > 1, f"Feature map ({H}, {W}) invalid"
+
+        t = torch.linspace(-1, 1, steps=sample_res, device=device, dtype=dtype)
+        # Scale for align_corners=False (width = W)
+        xs = t * (sample_res - 1.0) / W
+        ys = t * (sample_res - 1.0) / H
+        ys, xs = torch.meshgrid(ys, xs, indexing="ij")
+        base_grid = torch.stack([xs, ys], dim=-1)  # (sample_res, sample_res, 2)
+
+        val = SampleGrid(grid=base_grid)
+
+        cls._GRID_CACHE[key] = val
+        if len(cls._GRID_CACHE) > keep:
+            first_key = next(iter(cls._GRID_CACHE))
+            del cls._GRID_CACHE[first_key]
+
         return val
 
-    H_out = H - kernel_size + 1
-    W_out = W - kernel_size + 1
-    assert H > 1 and W > 1, f"Feature map ({H}, {W}) or kernel size ({kernel_size}) invalid"
+    @staticmethod
+    def lookup_grid(
+        query_points_xy: torch.Tensor,
+        feature_maps: list[torch.Tensor],
+        grids: list[SampleGrid],
+    ) -> list[torch.Tensor]:
+        """
+        Lookup local patches around query points from multiple feature maps.
 
-    t = torch.linspace(-1, 1, steps=sample_res, device=device, dtype=dtype)
-    # Scale for align_corners=False (width = W)
-    xs = t * (sample_res - 1.0) / W_out
-    ys = t * (sample_res - 1.0) / H_out
-    ys, xs = torch.meshgrid(ys, xs, indexing="ij")
-    base_grid = torch.stack([xs, ys], dim=-1)  # (sample_res, sample_res, 2)
+        Args:
+            query_points_xy: 2D query points in normalized [-1, 1] coordinates, shape (batch_size, num_queries, 2).
+            queried_feature_maps: List of feature maps to sample from, each with shape (batch_size, C_i, H_i, W_i).
+            grids: List of SampleGrid objects corresponding to each feature map.
+        Returns:
+            Local features at each query point from all feature maps, list of shape
+            (batch_size, num_queries, C_i, res_h, res_w).
+        """
+        batch_size, num_queries, _ = query_points_xy.shape
 
-    assert H_out == W_out, "Currently only square feature maps supported"
-    # Scale factor to map full image coordinates to feature map coordinates,
-    # needed because of valid padding in QueriedFeatureExtractor
-    scale = W / W_out
+        # For each feature map, sample local features around each query point
+        sampled_features = []
+        for feat_map, grid in zip(feature_maps, grids):
+            # assert feat_map.dim() == 5, f"{feat_map.shape=}"
+            # assert feat_map.shape[:2] == (batch_size, num_queries), f"{feat_map.shape=}"
+            _, C, _, _ = feat_map.shape
 
-    val = SampleGrid(grid=base_grid, scale=scale)
+            base_grid = grid.grid  # (sample_res, sample_res, 2)
+            res_h, res_w, _ = base_grid.shape
 
-    _GRID_CACHE[key] = val
-    if len(_GRID_CACHE) > keep:
-        first_key = next(iter(_GRID_CACHE))
-        del _GRID_CACHE[first_key]
+            base_grid = base_grid.view(1, 1, *base_grid.shape)  # (1, 1, sample_res, sample_res, 2)
 
-    return val
+            coords: torch.Tensor = query_points_xy.view(batch_size, num_queries, 1, 1, 2)
+            coords = coords + base_grid  # (batch_size, num_queries, sample_res, sample_res, 2)
+            coords = coords.view(batch_size, num_queries * res_h, res_w, 2)
 
-
-def lookup_grid(
-    query_points_xy: torch.Tensor,
-    sample_res: list[int],
-    queried_feature_maps: list[torch.Tensor],
-    grids: list[SampleGrid],
-) -> list[torch.Tensor]:
-    """
-    Lookup local patches around query points from multiple feature maps.
-
-    Args:
-        query_points_xy: 2D query points in normalized [-1, 1] coordinates, shape (batch_size, num_queries, 2).
-        sample_res: Resolution of the sample grid (e.g., 3 for 3x3 patches).
-        queried_feature_maps: List of feature maps to sample from, each with shape (batch_size, num_queries, n_heads, H, W).
-        grids: Precomputed sample grids.
-        image_size: Original image size (height, width) passed into the backbone.
-        feature_extractor: The ImageFeatureExtractor used to extract the features, passed to correct coordinate bias.
-    Returns:
-        Local features around each query point from all feature maps, list of shape
-        (batch_size, num_queries, n_heads, sample_res, sample_res).
-    """
-    batch_size, num_queries, _ = query_points_xy.shape
-
-    # For each feature map, sample local features around each query point
-    sampled_features = []
-    for i, feat_map in enumerate(queried_feature_maps):
-        # assert feat_map.dim() == 5, f"{feat_map.shape=}"
-        # assert feat_map.shape[:2] == (batch_size, num_queries), f"{feat_map.shape=}"
-        _, _, n_heads, H, W = feat_map.shape
-
-        # Create sample grid for samples_res x sample_res patches with the step of pixel size
-        res = sample_res[i]
-        grid = grids[i]
-
-        # Correct for coordinate bias and scale coordinates
-        current_points = query_points_xy * grid.scale
-
-        # Translate sample grid to each query point
-        translated_grid = grid.grid.unsqueeze(0).unsqueeze(0) + current_points.unsqueeze(2).unsqueeze(
-            2
-        )  # (batch_size, num_queries, sample_res, sample_res, 2)
-
-        feat = torch.nn.functional.grid_sample(
-            feat_map.view(-1, n_heads, H, W),  # (B * num_queries, n_heads, H, W)
-            translated_grid.view(-1, res, res, 2),  # (batch_size * num_queries, res, res, 2)
-            align_corners=False,
-            mode="bilinear",
-            padding_mode="border",
-        )  # (B * num_queries, n_heads, sample_res, sample_res)
-        feat = feat.view(batch_size, -1, n_heads, res, res)  # (B, num_queries, n_heads, sample_res, sample_res)
-        sampled_features.append(feat)
-    return sampled_features
+            feat = torch.nn.functional.grid_sample(
+                feat_map,  # (B, C, H, W)
+                coords,
+                align_corners=False,
+                mode="bilinear",
+                padding_mode="border",
+            )  # (B, C, num_queries * res_h, res_w)
+            feat = feat.view(batch_size, C, num_queries, res_h, res_w)
+            feat = feat.transpose(1, 2)  # (batch_size, num_queries, C, res_h, res_w)
+            sampled_features.append(feat)
+        return sampled_features
 
 
 class LearnedTempSoftShrink(nn.Module):

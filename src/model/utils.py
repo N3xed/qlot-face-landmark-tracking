@@ -1,39 +1,39 @@
 from __future__ import annotations
+import itertools
 import torch
+import torch.fx.node
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
-from .cov import GenericCov2D, LowRankCov2D
+from .cov import Cov, NUM_PREDS_COV_PARAMS
 from torch import nn
 from threading import Lock
-import torch.nn.functional as F
 import utils.mesh
 from utils.torch.datasets import CanonicalLandmarks
 
-
-def preds_coords(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor[..., 0:2]
-
-
-def preds_cov(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor[..., 2:5]
-
-
-def preds_delta(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor[..., 5:7]
-
-
 NUM_PREDS_COORDS = 2
-NUM_PREDS_COV_PARAMS = 3
 NUM_PREDS_DELTA = 2
 
 NUM_PREDS_PARAMS = NUM_PREDS_COORDS + NUM_PREDS_COV_PARAMS + NUM_PREDS_DELTA
 
 
+def preds_coords(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor[..., 0:NUM_PREDS_COORDS]
+
+
+def preds_cov(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor[..., NUM_PREDS_COORDS : NUM_PREDS_COORDS + NUM_PREDS_COV_PARAMS]
+
+
+def preds_delta(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor[..., NUM_PREDS_COORDS + NUM_PREDS_COV_PARAMS :]
+
+
 @dataclass
 class LandmarkPrediction:
     mean: torch.Tensor  # Landmarks, shape: (..., num_queries, 2)
-    cov: GenericCov2D  # Covariance matrix per landmark, shape: (..., num_queries, params_dim).
+    cov: Cov  # Covariance matrix per landmark, shape: (..., num_queries, params_dim).
     delta: torch.Tensor  # Landmark deltas, shape: (..., num_queries, 2)
 
     def normalize_coords(self, image_width: int, image_height: int) -> "LandmarkPrediction":
@@ -61,7 +61,7 @@ class LandmarkPrediction:
             [self.delta[..., 0] * scale_x, self.delta[..., 1] * scale_y],
             dim=-1,
         )
-        cov = self.cov.scale_clamp(scale=(scale_x, scale_y))
+        cov = self.cov.scale(scale_x, scale_y)
         return LandmarkPrediction(mean=normalized_mean, cov=cov, delta=normalized_delta)
 
     def unnormalize_coords(self, image_width: int, image_height: int) -> "LandmarkPrediction":
@@ -89,67 +89,14 @@ class LandmarkPrediction:
             [self.delta[..., 0] * scale_x, self.delta[..., 1] * scale_y],
             dim=-1,
         )
-        cov = self.cov.scale_clamp(scale=(scale_x, scale_y))
-        return LandmarkPrediction(mean=unnormalized_mean, cov=cov, delta=unnormalized_delta)
-
-    def unnormalize_coords_clamp(
-        self,
-        image_width: int,
-        image_height: int,
-        min: float | None,
-        max: float | None,
-        log_min_std_dev: float | None,
-        log_max_std_dev: float | None,
-    ) -> "LandmarkPrediction":
-        """
-        Clamp and unnormalize the landmark coordinates from [-1, 1] range to pixel coordinates based on image dimensions.
-        Args:
-            image_width: Width of the image.
-            image_height: Height of the image.
-            min: Minimum value to clamp the mean coordinates.
-            max: Maximum value to clamp the mean coordinates.
-            log_min_std_dev: Minimum value to clamp the log standard deviation of the covariance.
-            log_max_std_dev: Maximum value to clamp the log standard deviation of the covariance.
-        Returns:
-            LandmarkPrediction with unnormalized coordinates.
-        """
-        scale_x = image_width / 2.0
-        scale_y = image_height / 2.0
-
-        # A clamp with no bounds is a no-op (e.g. the ONNX export path);
-        # an unconditional clamp(min, max) raises under eager torch and
-        # fails to export under dynamo.
-        if min is not None or max is not None:
-            mean = self.mean.clamp(min, max)
-        else:
-            mean = self.mean
-        cov = self.cov.scale_clamp(
-            scale=(scale_x, scale_y),
-            log_min_stddev=log_min_std_dev,
-            log_max_stddev=log_max_std_dev,
-        )
-
-        # Subtract 0.5 to return to pixel center coordinates
-        # unnormalized_mean = (self.mean + 1.0) * scale - 0.5
-        unnormalized_mean = torch.stack(
-            [
-                mean[..., 0] * scale_x + (scale_x - 0.5),
-                mean[..., 1] * scale_y + (scale_y - 0.5),
-            ],
-            dim=-1,
-        )
-        unnormalized_delta = torch.stack(
-            [self.delta[..., 0] * scale_x, self.delta[..., 1] * scale_y],
-            dim=-1,
-        )
-
+        cov = self.cov.scale(scale_x, scale_y)
         return LandmarkPrediction(mean=unnormalized_mean, cov=cov, delta=unnormalized_delta)
 
     def to_tensor(self) -> torch.Tensor:
         return torch.cat([self.mean, self.cov.params, self.delta], dim=-1)
 
     @staticmethod
-    def from_tensor(tensor: torch.Tensor, cov_type: type = LowRankCov2D) -> "LandmarkPrediction":
+    def from_tensor(tensor: torch.Tensor, cov_type: type = Cov) -> "LandmarkPrediction":
         mean = preds_coords(tensor)
         cov = cov_type(preds_cov(tensor))
         delta = preds_delta(tensor)
@@ -163,15 +110,6 @@ class LandmarkPrediction:
 
     def clone(self) -> "LandmarkPrediction":
         return LandmarkPrediction(mean=self.mean.clone(), cov=self.cov.clone(), delta=self.delta.clone())
-
-    def to_mean_max_variance(self) -> torch.Tensor:
-        """
-        Convert the LandmarkPrediction to a tensor containing mean and maximum variance.
-        Returns:
-            Tensor of shape (..., 3) containing (mean_x, mean_y, max_variance).
-        """
-        max_variance = self.cov.max_variance.unsqueeze(-1)
-        return torch.cat([self.mean, max_variance], dim=-1)
 
     def record_stream(self, stream: torch.Stream) -> None:
         """
@@ -482,6 +420,34 @@ class _StreamBatchNormState:
     num_updates: int = 0
 
 
+_STREAM_BN_ID_COUNTER = itertools.count(1)
+_STREAM_BN_REGISTRY: dict[int, weakref.ReferenceType[StreamSafeBatchNorm]] = {}
+
+
+@torch.library.custom_op("qlot::update_stream_bn_stats", mutates_args=())
+def _update_stream_bn_stats(
+    bn_id: int,
+    batch_mean: torch.Tensor,
+    batch_var: torch.Tensor,
+) -> None:
+    ref = _STREAM_BN_REGISTRY.get(bn_id)
+    if ref is not None and (bn := ref()) is not None:
+        bn._update_stream_stats(batch_mean, batch_var)
+
+
+@_update_stream_bn_stats.register_fake
+def _(
+    bn_id: int,
+    batch_mean: torch.Tensor,
+    batch_var: torch.Tensor,
+) -> None:
+    del bn_id, batch_mean, batch_var
+    return None
+
+
+torch.fx.node.has_side_effect(torch.ops.qlot.update_stream_bn_stats.default)
+
+
 class StreamSafeBatchNorm(nn.BatchNorm2d, FlushStream):
     """BatchNorm with independent running statistics for each CUDA stream."""
 
@@ -506,32 +472,34 @@ class StreamSafeBatchNorm(nn.BatchNorm2d, FlushStream):
         )
         self._stream_states: dict[tuple[int, int], _StreamBatchNormState] = {}
         self._stream_states_lock = Lock()
+        self._bn_id = next(_STREAM_BN_ID_COUNTER)
+        _STREAM_BN_REGISTRY[self._bn_id] = weakref.ref(self)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if input.device.type != "cuda" or not self.training or not self.track_running_stats:
+        if input.device.type != "cuda" or not self.training or not self.track_running_stats or torch.compiler.is_exporting():
             return super().forward(input)
         return self._forward_stream_safe(input)
 
-    @torch._dynamo.disable()
-    def _forward_stream_safe(self, input: torch.Tensor) -> torch.Tensor:
-        self._check_input_dim(input)
-        device_index = input.device.index
-        stream = torch.cuda.current_stream(device=input.device)
+    def _update_stream_stats(self, batch_mean: torch.Tensor, batch_var: torch.Tensor) -> None:
+        device_index = batch_mean.device.index
+        stream = torch.cuda.current_stream(device=batch_mean.device)
         key = (device_index, stream.cuda_stream)
 
         state = self._stream_states.get(key)
         if state is None:
             # Lazily add a stream-local state.
             with self._stream_states_lock:
-                assert self.running_mean is not None
-                assert self.running_var is not None
-                assert self.num_batches_tracked is not None
-                state = _StreamBatchNormState(
-                    running_mean=self.running_mean.clone(),
-                    running_var=self.running_var.clone(),
-                    num_batches_tracked=self.num_batches_tracked.clone(),
-                )
-                self._stream_states[key] = state
+                state = self._stream_states.get(key)
+                if state is None:
+                    assert self.running_mean is not None
+                    assert self.running_var is not None
+                    assert self.num_batches_tracked is not None
+                    state = _StreamBatchNormState(
+                        running_mean=self.running_mean.clone(),
+                        running_var=self.running_var.clone(),
+                        num_batches_tracked=self.num_batches_tracked.clone(),
+                    )
+                    self._stream_states[key] = state
         state.num_updates += 1
 
         state.num_batches_tracked.add_(1)
@@ -540,16 +508,24 @@ class StreamSafeBatchNorm(nn.BatchNorm2d, FlushStream):
         else:
             exponential_average_factor = self.momentum
 
-        return F.batch_norm(
+        state.running_mean.lerp_(batch_mean.to(dtype=state.running_mean.dtype), exponential_average_factor)
+        state.running_var.lerp_(batch_var.to(dtype=state.running_var.dtype), exponential_average_factor)
+
+    def _forward_stream_safe(self, input: torch.Tensor) -> torch.Tensor:
+        self._check_input_dim(input)
+        output, save_mean, save_rstd = torch.ops.aten._native_batch_norm_legit.no_stats(
             input,
-            state.running_mean,
-            state.running_var,
             self.weight,
             self.bias,
-            training=True,
-            momentum=exponential_average_factor,
-            eps=self.eps,
+            True,
+            0.0,
+            self.eps,
         )
+        n = input.numel() // input.shape[1]
+        batch_mean = save_mean.detach()
+        batch_var = (save_rstd.detach().reciprocal().square() - self.eps).clamp_min(0.0) * (n / (n - 1))
+        _update_stream_bn_stats(self._bn_id, batch_mean, batch_var)
+        return output
 
     @torch.no_grad()
     def flush_stream(self) -> None:

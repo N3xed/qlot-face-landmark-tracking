@@ -65,7 +65,7 @@ train_im_size = 224
 test_im_size = 224
 test_padding_ratio = 0.10
 synth_clip_len = 4
-video_clip_len = 16
+video_clip_len = 12
 
 
 def _make_videoify() -> Videoify:

@@ -221,8 +221,8 @@ class LowRankWriteReadMixer(nn.Module):
 
     def __init__(
         self,
-        query_dim: int,
-        key_dim: int,
+        read_dim: int,
+        write_dim: int,
         value_in_dim: int,
         value_dim: int,
         out_dim: int = 256,
@@ -257,24 +257,23 @@ class LowRankWriteReadMixer(nn.Module):
         # Asymmetric routing: context features decide what each landmark contributes
         # to shared basis slots, while identity + temporal state decide what each
         # landmark reads back from those slots.
-        self.write_route = nn.Sequential(
-            nn.Linear(key_dim, hidden_dim),
-            nn.SiLU(),
-        )
+        self.write_route = nn.Sequential(nn.Linear(write_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 2 * rank * heads))
         nn.init.kaiming_normal_(self.write_route[0].weight, nonlinearity="relu")  # type: ignore
         nn.init.zeros_(self.write_route[0].bias)  # type: ignore
 
-        self.read_route = nn.Sequential(nn.Linear(query_dim, hidden_dim), nn.SiLU())
+        nn.init.kaiming_uniform_(self.write_route[2].weight, nonlinearity="linear")  # type: ignore
+        with torch.no_grad():
+            self.write_route[2].weight *= math.sqrt(3.0)  # type: ignore
+        nn.init.zeros_(self.write_route[2].bias)  # type: ignore
+
+        self.read_route = nn.Sequential(nn.Linear(read_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, rank * heads))
         nn.init.kaiming_normal_(self.read_route[0].weight, nonlinearity="relu")  # type: ignore
         nn.init.zeros_(self.read_route[0].bias)  # type: ignore
+        nn.init.kaiming_uniform_(self.read_route[2].weight, nonlinearity="linear")  # type: ignore
+        nn.init.zeros_(self.read_route[2].bias)  # type: ignore
 
-        self.write_proj = nn.Linear(hidden_dim, 2 * rank * heads)
-        nn.init.kaiming_uniform_(self.write_proj.weight, nonlinearity="linear")
-        nn.init.zeros_(self.write_proj.bias)
-
-        self.write_temperature = nn.Parameter(torch.empty(1, 1, 2 * heads * rank))
-        nn.init.normal_(self.write_temperature, mean=0.0, std=0.5)
-        self.read_proj = nn.Linear(hidden_dim, rank * heads)
+        self.wr_temperature = nn.Parameter(torch.empty(1, 1, 3 * heads * rank))
+        nn.init.normal_(self.wr_temperature, mean=0.0, std=0.5)
 
         assert value_dim % heads == 0, "value_dim must be divisible by heads"
         self.head_dim = value_dim // heads
@@ -282,12 +281,12 @@ class LowRankWriteReadMixer(nn.Module):
         self.value_proj = nn.Linear(value_in_dim, value_dim)
         nn.init.xavier_normal_(self.value_proj.weight, gain=1.0)
         nn.init.zeros_(self.value_proj.bias)
-        self.query_proj = nn.Linear(query_dim, value_dim)
-        nn.init.xavier_normal_(self.query_proj.weight, gain=1.0)
-        nn.init.zeros_(self.query_proj.bias)
+        self.read_proj = nn.Linear(read_dim, value_dim)
+        nn.init.xavier_normal_(self.read_proj.weight, gain=1.0)
+        nn.init.zeros_(self.read_proj.bias)
 
-        # When enable_spread=False, we only have 3 residual branches (query, attn, mlp)
-        # instead of 4 (spread, query, attn, mlp).
+        # When enable_spread=False, we only have 3 residual branches (read, attn, mlp)
+        # instead of 4 (spread, read, attn, mlp).
         residual_count = 4 if enable_spread else 3
         self.residual_weights = nn.Parameter(
             torch.randn((residual_count, 1, heads, 1, 1)) * 0.025
@@ -302,11 +301,11 @@ class LowRankWriteReadMixer(nn.Module):
         else:
             self.basis_spread_proj = nn.Identity()
 
-        self.basis_query_proj = nn.Sequential(
+        self.basis_read_proj = nn.Sequential(
             HeadedLinear(self.head_dim, 2 * self.head_dim, heads, head_dim=-3, init_out_dim=self.head_dim),
             nn.GLU(),
         )
-        self.basis_query_proj[0].init_glu()  # type: ignore
+        self.basis_read_proj[0].init_glu()  # type: ignore
 
         # Lightweight self-attention across the low-rank basis slots. This lets
         # learned topology factors exchange information without forming an
@@ -377,9 +376,9 @@ class LowRankWriteReadMixer(nn.Module):
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        read_feat: torch.Tensor,
+        write_feat: torch.Tensor,
+        value_feat: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -394,12 +393,14 @@ class LowRankWriteReadMixer(nn.Module):
         Returns:
             Tensor of shape (B, N, value_dim) after write-mix-read.
         """
-        write_route = self.write_route(key)  # (B, N, Dh)
-        read_route = self.read_route(query)  # (B, N, Dh)
+        wr_temperature = torch.exp2(self.wr_temperature / 3.0)  # (1, 1, 3 * H * R)
+        w_temp = wr_temperature[:, :, :2 * self.heads * self.rank]  # (1, 1, 2 * H * R)
+        r_temp = wr_temperature[:, :, 2 * self.heads * self.rank:]  # (1, 1, H * R)
 
-        write_logits: torch.Tensor = self.write_proj(write_route)  # (B, N, 2 * H * R)
-        write_logits = write_logits / torch.exp2(self.write_temperature / 3.0)  # (B, N, 2 * H * R)
+        write_logits: torch.Tensor = self.write_route(write_feat)  # (B, N, 3 * H * R)
+        write_logits = write_logits / w_temp  # (B, N, 2 * H * R)
         write_logits = write_logits.unflatten(dim=-1, sizes=(2, self.heads, self.rank))  # (B, N, 2, H, R)
+
 
         # For each basis slot, distribute over landmarks.
         if key_padding_mask is not None:
@@ -418,9 +419,9 @@ class LowRankWriteReadMixer(nn.Module):
 
         # Aggregate rank-R global basis vectors.
         write_v = write[:, :, 0]  # (B, N, H, R)
-        v: torch.Tensor = self.value_proj(value).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D)
-        write_q = write[:, :, 1]  # (B, N, H, R)
-        q: torch.Tensor = self.query_proj(query).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D)
+        v: torch.Tensor = self.value_proj(value_feat).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D)
+        write_r = write[:, :, 1]  # (B, N, H, R)
+        r: torch.Tensor = self.read_proj(read_feat).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D)
 
         if self.enable_spread:
             # Fuse mean E[v] and second moment E[v²] into a single matmul,
@@ -451,16 +452,16 @@ class LowRankWriteReadMixer(nn.Module):
             basis = self._weighted_basis(write_v, v)  # (B, H, R, D)
             residual_w = self.residual_weights
 
-        # Also write query/hidden state to basis slots
-        basis_query = self._weighted_basis(write_q, q)  # (B, H, R, D)
-        basis = basis + residual_w[-3] * self.basis_query_proj(basis_query)  # (B, H, R, D)
+        # Also write read_feat to slots
+        basis_read = self._weighted_basis(write_r, r)  # (B, H, R, D)
+        basis = basis + residual_w[-3] * self.basis_read_proj(basis_read)  # (B, H, R, D)
 
         # Mixing across basis slots.
         # This is O(R^2 D) with small R, so it preserves linear scaling in N.
         qkv: torch.Tensor = self.attn_qkv_proj(basis)  # (B, H, R, 3*Daq + Dav)
-        q, k, v = qkv.split([self.attn_qk_token_dim, self.attn_qk_token_dim, self.attn_v_token_dim], dim=-1)
+        r, k, v = qkv.split([self.attn_qk_token_dim, self.attn_qk_token_dim, self.attn_v_token_dim], dim=-1)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, R, Dav)
+        attn_out = F.scaled_dot_product_attention(r, k, v)  # (B, H, R, Dav)
         attn_out = self.attn_out_proj(attn_out)  # (B, H, R, D)
         basis = basis + residual_w[-2] * attn_out  # (B, H, R, D)
 
@@ -469,7 +470,10 @@ class LowRankWriteReadMixer(nn.Module):
         basis = basis + residual_w[-1] * basis_mlp_out  # (B, H, R, D)
 
         # Each landmark makes a convex combination of the basis slots.
-        read_logits: torch.Tensor = self.read_proj(read_route).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, R)
+        read_logits: torch.Tensor = self.read_route(read_feat)  # (B, N, H * R)
+        read_logits = read_logits / r_temp  # (B, N, H * R)
+        read_logits: torch.Tensor = read_logits.unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, R)
+
         # Softmax over slots.
         read = read_logits.softmax(dim=-1)  # (B, N, H, R)
         msg = self._read_from_basis(read, basis)  # (B, H, N, D)
@@ -481,7 +485,7 @@ class LowRankWriteReadMixer(nn.Module):
             msg = msg + LowRankWriteReadMixer._read_from_basis(masked_read, basis.detach() - basis)
 
         # Bypass Write-Mix-Read for local features from processed values.
-        local: torch.Tensor = self.local_proj(value).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D // 2)
+        local: torch.Tensor = self.local_proj(value_feat).unflatten(dim=-1, sizes=(self.heads, -1))  # (B, N, H, D // 2)
         local = local.transpose(1, 2)  # (B, H, N, D // 2)
         local = self.local_head_proj(local)  # (B, H, N, 2 * D)
         local_factor, local_offset = local.chunk(2, dim=-1)  # each (B, H, N, D)
@@ -496,148 +500,24 @@ class LowRankWriteReadMixer(nn.Module):
         return mixed
 
 
-class UpdatePredictor(nn.Module):
-    def __init__(
-        self,
-        context_feat_dim: int,
-        corr_feat_dim: int,
-        mixer_rank: int = 8,
-        mixer_heads: int = 4,
-        mixer_hidden_dim: int = 128,
-        mixer_value_dim: int = 256,
-        hidden_state_dim: int = 128,
-        query_enc_dim: int = 128,
-        enable_spread: bool = False,
-    ):
-        """
-        Predict landmark updates and covariance matrix based on landmark features.
-        Uses low rank mixing + leaky-integrator (GRU) update block.
-
-        Args:
-            context_feat_dim: Dimension of the context features for each landmark.
-            corr_feat_dim: Dimension of the correlation features for each landmark.
-            mixer_rank: Number of basis slots for low rank mixing.
-            mixer_heads: Number of parallel mixer heads.
-            mixer_hidden_dim: Hidden dimension for the routing MLPs in the mixer.
-            evidence_dim: Dimension of the evidence features produced by the mixer.
-            mixer_value_dim: Total mixing dimension per slot (must be divisible by `mixer_heads`).
-            hidden_state_dim: Hidden dimension for the recurrent latent state.
-            pred_hidden_dim: Hidden dimension for the prediction head.
-            out_dim: Output dimension for the predicted landmarks.
-            query_enc_dim: Dimension of the query encodings for each landmark.
-        """
+class GRU(nn.Module):
+    def __init__(self, hidden_dim: int):
         super().__init__()
-
-        self.context_feat_dim = context_feat_dim
-        self.corr_feat_dim = corr_feat_dim
-
-        self.hidden_state_dim = hidden_state_dim
-        self.lmk_feat_dim = context_feat_dim + corr_feat_dim
-
-        self.query_input_dim = hidden_state_dim + query_enc_dim
-        self.hidden_norm = nn.RMSNorm(hidden_state_dim)
-
-        self.mixer = LowRankWriteReadMixer(
-            query_dim=self.query_input_dim,
-            key_dim=context_feat_dim,
-            value_in_dim=corr_feat_dim,
-            value_dim=mixer_value_dim,
-            out_dim=hidden_state_dim * 2,
-            rank=mixer_rank,
-            heads=mixer_heads,
-            hidden_dim=mixer_hidden_dim,
-            enable_spread=enable_spread,
-        )
-
-        self.gate_proj = nn.Sequential(nn.SiLU(), nn.Linear(hidden_state_dim, 3 * hidden_state_dim), nn.Sigmoid())
-        nn.init.kaiming_normal_(self.gate_proj[-2].weight, nonlinearity="sigmoid")  # type: ignore
-        with torch.no_grad():
-            # Scale up, since we split into 3 gates.
-            self.gate_proj[-2].weight.mul_(math.sqrt(3.0))  # type: ignore
-
-        # reset, update, gain
-        gate_bias: torch.Tensor = self.gate_proj[-2].bias  # type: ignore
-        # reset gate
-        nn.init.constant_(gate_bias[:hidden_state_dim], 0.0)
-        # update gate
-        # Start with a lower update gate bias, so the hidden state is preserved at the start.
-        nn.init.constant_(gate_bias[hidden_state_dim : 2 * hidden_state_dim], logit(0.4))
-        # gain gate
-        # Start with a high gain, so candidate is perserved.
-        nn.init.constant_(gate_bias[2 * hidden_state_dim :], logit(0.9))
-
-        self.hidden_proj = nn.Linear(hidden_state_dim, hidden_state_dim)
+        self.hidden_dim = hidden_dim
+        self.hidden_proj = nn.Linear(hidden_dim, hidden_dim)
         init(self.hidden_proj, nonlinearity="tanh")
-
-        self.pred_head = nn.Sequential(
-            HeadedLinear(hidden_state_dim, 128, heads=2, head_dim=-3),
-            nn.GLU(),
-        )
-        self.pred_head[0].init_glu()  # type: ignore
-
-        self.coord_proj = nn.Linear(64, NUM_PREDS_COORDS)
-        self.cov_proj = nn.Linear(64, NUM_PREDS_COV_PARAMS)
-        nn.init.xavier_uniform_(self.coord_proj.weight, gain=0.1)  # type: ignore
-        nn.init.constant_(self.coord_proj.bias, 0.0)  # type: ignore
-        nn.init.xavier_uniform_(self.cov_proj.weight, gain=0.1)  # type: ignore
-        nn.init.constant_(self.cov_proj.bias, 0.0)  # type: ignore
-
-        if not torch.compiler.is_exporting():
-            self.cand_mult: torch.Tensor | None = None
-            self.cand_offset: torch.Tensor | None = None
-            self.last_hidden_state: torch.Tensor | None = None
 
     def forward(
         self,
-        context_feat: torch.Tensor,
-        corr_feat: torch.Tensor,
         hidden_state: torch.Tensor,
-        query_encodings: torch.Tensor,
-        mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass.
-        Args:
-            corr_feat: Correlation features for each landmark, shape (batch_size, num_queries, feature_dim).
-            context_feat: Context features for each landmark, shape (batch_size, num_queries, feature_dim).
-            hidden_state: Previous hidden state for each landmark, shape (batch_size, num_queries, hidden_dim).
-            query_encodings: Encoded query point features, shape (num_queries, query_enc_dim).
-            mask: Optional boolean mask for write-mix-read (batch_size, num_queries), True = ignore.
-        Returns:
-            A tuple containing:
-             - Landmark updates (dx, dy), shape (batch_size, num_queries, NUM_PREDS_COORDS).
-             - Covariance matrix params, shape (batch_size, num_queries, NUM_PREDS_COV_PARAMS).
-             - Updated hidden state h_t, shape (batch_size, num_queries, hidden_dim).
-        """
-
-        hidden_normed = self.hidden_norm(hidden_state)  # (B, N, hidden_dim)
-        hidden_state_feat = torch.cat([hidden_normed, query_encodings], dim=-1)  # (B, N, hidden_dim + query_enc_dim)
-
-        # Low-rank mixing of correlation features with context and hidden state.
-        mixed = self.mixer(
-            query=hidden_state_feat,
-            key=context_feat,
-            value=corr_feat,
-            key_padding_mask=mask,
-        )
-
-        candidate, gate_feat = mixed.chunk(2, dim=-1)  # each (B, N, hidden_dim)
-
-        gate = self.gate_proj(gate_feat)  # (B, N, 3 * hidden_dim)
-        reset, update, gain = gate.chunk(3, dim=-1)  # each (B, N, hidden_dim)
-
-        candidate = torch.tanh(reset * self.hidden_proj(hidden_normed) + candidate) * gain  # (B, N, hidden_dim)
-
+        hidden_state_in: torch.Tensor,
+        candidate: torch.Tensor,
+        update: torch.Tensor,
+        reset: torch.Tensor,
+    ) -> torch.Tensor:
+        candidate = torch.tanh(reset * self.hidden_proj(hidden_state_in) + candidate)
         if torch.compiler.is_exporting():
             next_hidden = (1.0 - update) * hidden_state + update * candidate  # (B, N, hidden_dim)
         else:
             next_hidden = torch.lerp(hidden_state, candidate, update)  # (B, N, hidden_dim)
-
-        pred_input = next_hidden.unsqueeze(-3)  # (B, 1, N, hidden_dim)
-        output = self.pred_head(pred_input)  # (B, 2, N, 64)
-
-        coord_output, cov_output = output.unbind(dim=-3)  # each (B, N, 64)
-        coord_output = self.coord_proj(coord_output)
-        cov_output = self.cov_proj(cov_output)
-
-        return coord_output, cov_output, next_hidden
+        return next_hidden

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import timm
 from kernels.fused_conv_sample import fused_conv_sample
+from itertools import pairwise
 from .utils import init, StreamSafeBatchNorm
 
 
@@ -260,21 +261,20 @@ class ImageFeatureExtractor(nn.Module):
     mean_tensor: torch.Tensor
     std_tensor: torch.Tensor
 
-    def __init__(
-        self,
-        global_dim=256,
-        d_model=256,
-        n_heads: list[int] = [4, 6, 8],
-        pretrained: bool | str = True,
-    ):
+    map_channels: list[int]  # Number of channels for each output feature map
+    n_maps: int  # Number of output feature maps
+    global_channels: int  # Number of channels for the global feature vector
+    backbone_map_strides: list[int]  # Stride of each backbone feature map relative to the input image
+
+    def __init__(self, map_channels: list[int] = [64, 128, 192], pretrained: bool | str = True, stream_safe: bool = False):
         """
         Initializes the feature extractor.
         Args:
+            map_channels: List of output channels for each feature map.
             pretrained: Whether to load pretrained weights. `True` loads pretrained
                 weights from timm, `False` initializes randomly, and a string loads weights
                 from the specified path.
-            global_dim: Dimension of the global feature vector.
-            d_model: Dimension to project feature maps to.
+            stream_safe: If True, replaces batchnorm layers with stream-safe versions.
         """
         super().__init__()
 
@@ -292,8 +292,11 @@ class ImageFeatureExtractor(nn.Module):
             features_only=True,
         )
 
-        if not torch.compiler.is_exporting():
+        if not torch.compiler.is_exporting() and stream_safe:
             _replace_batchnorms(self.backbone)
+            batch_norm_cls = StreamSafeBatchNorm
+        else:
+            batch_norm_cls = nn.BatchNorm2d
 
         # Normalization parameters for ImageNet (pretrained checkpoint is trained on ImageNet-1k)
         self.mean = [0.485, 0.456, 0.406]
@@ -302,45 +305,50 @@ class ImageFeatureExtractor(nn.Module):
         self.register_buffer("mean_tensor", torch.tensor(self.mean).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("std_tensor", torch.tensor(self.std).view(1, 3, 1, 1), persistent=False)
 
-        self.d_model = d_model
-        self.feature_layers = [-4, -3, -2]
-        self.num_feature_maps = len(self.feature_layers)
+        backbone_map_layers = [-4, -3, -2]
+        feature_dims = [self.backbone.feature_info[i]["num_chs"] for i in self.out_indices]
+        self.backbone_map_strides = [self.backbone.feature_info[i]["reduction"] for i in self.out_indices]
 
-        self.feature_dims = [self.backbone.feature_info[i]["num_chs"] for i in self.out_indices]
-        self.feature_map_reductions = [self.backbone.feature_info[i]["reduction"] for i in self.out_indices]
+        assert len(map_channels) == len(backbone_map_layers), "Length of map_channels must match number of feature layers"
+        self.map_channels = map_channels
+        self.global_channels = feature_dims[-1]
+        self.n_maps = len(self.map_channels)
 
-        self.projections = nn.ModuleList(
+        self.proj = nn.ModuleList(
             [
-                # Fast sparse 1x1 using a hardware-friendly group size
-                (
-                    nn.Sequential(
-                        nn.Conv2d(fd, 128, kernel_size=1, bias=False, groups=4),
-                        ChannelShuffle(groups=4),
-                        nn.Conv2d(128, self.d_model, kernel_size=1, bias=False, groups=4),
-                    )
-                    if fd > self.d_model
-                    else nn.Conv2d(fd, self.d_model, kernel_size=1, bias=False)
-                )
-                for fd, heads in zip(self.feature_dims[: len(self.feature_layers)], n_heads)
+                nn.Conv2d(fd_backbone, fd_down, kernel_size=1) if fd_backbone != fd_down else nn.Identity()
+                for fd_down, fd_backbone in zip(map_channels, feature_dims[: self.n_maps])
+            ]
+        )
+        self.down_proj = nn.ModuleList(
+            [
+                nn.Conv2d(fd_next_level, fd, kernel_size=1) if fd != fd_next_level else nn.Identity()
+                for fd, fd_next_level in pairwise(self.map_channels)
             ]
         )
 
-        for proj in self.projections:
-            if isinstance(proj, nn.Sequential):
-                init(proj[0], nonlinearity="linear")
-                init(proj[2], nonlinearity="linear")
-            else:
-                init(proj, nonlinearity="linear")
+        for proj in self.proj:
+            if isinstance(proj, nn.Identity):
+                continue
+            init(proj, nonlinearity="linear")
+        for proj in self.down_proj:
+            if isinstance(proj, nn.Identity):
+                continue
+            init(proj, nonlinearity="linear")
 
-        # We have len(feature_layers) - 1 fusion operations.
-        num_fusions = len(self.feature_layers) - 1
-        assert len(n_heads) == num_fusions + 1, "Length of n_heads must match number of fusions + 1"
-
-        self.fusion_conv = nn.ModuleList(FusionBlock(self.d_model, groups=4) for heads in n_heads[:-1])
+        self.fusion_conv = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(fd, fd, kernel_size=3, groups=fd, padding=1, bias=False),
+                batch_norm_cls(fd),
+                nn.SiLU(),
+            )
+            for fd in self.map_channels
+        )
+        for conv in self.fusion_conv:
+            assert isinstance(conv, nn.Sequential)
+            init(conv[0], nonlinearity="linear")
 
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.global_proj = nn.Linear(self.feature_dims[-1], global_dim)
-        init(self.global_proj, nonlinearity="linear")
 
         if type(pretrained) == str:
             self.load_state_dict(torch.load(pretrained))
@@ -371,219 +379,32 @@ class ImageFeatureExtractor(nn.Module):
         # Feature Pyramid Network, top-down fusion
 
         # Lateral projections (Change channels to d_model)
-        projections = [proj(x[i]) for i, proj in enumerate(self.projections)]
+        projections = [proj(x[i]) for i, proj in enumerate(self.proj)]
 
-        # Top-down fusion
-        feature_maps = [projections[-1]]
+        # Contains maps of shape (B, C_i, H_i, W_i) for each level i
+        feature_maps = []
 
-        for i in reversed(range(len(projections) - 1)):
+        for i in reversed(range(len(self.down_proj))):
             high_res_map = projections[i]
-            low_res_map = feature_maps[0]  # The map we just processed, shape (B, C, H_low, W_low)
+
+            if feature_maps:
+                low_res_map = feature_maps[0]  # The map we just processed, shape (B, C, H_low, W_low)
+            else:
+                # Top-most level, no previous feature map to fuse with
+                low_res_map = projections[i + 1]
+                low_res_map = self.fusion_conv[i + 1](low_res_map)
+                feature_maps.insert(0, low_res_map)
+            low_res_map = self.down_proj[i](low_res_map)
 
             # Upsample low-res map to match high-res dimensions
-            # Use bilinear interpolation for smooth gradients
-            upsampled = F.interpolate(
-                low_res_map, size=high_res_map.shape[-2:], mode="bilinear", align_corners=False
-            )  # (B, C, H_high, W_high)
+            upsampled = F.interpolate(low_res_map, size=high_res_map.shape[-2:], mode="nearest")  # (B, C, H_high, W_high)
 
             fusion_conv = self.fusion_conv[i]
             m = fusion_conv(high_res_map + upsampled)
             feature_maps.insert(0, m)
 
         # Global Context
-        global_map = x[-1]  # (B, C, H, W)
+        global_map = x[-1]  # (B, C_3, H, W)
         global_feat = self.global_pool(global_map).flatten(1)  # (B, C)
-        global_feat = self.global_proj(global_feat)  # (B, global_dim)
 
         return feature_maps, global_feat
-
-
-class ImageFeatureCorrelator(nn.Module):
-    def __init__(
-        self,
-        n_heads: list[int],
-        n_feature_maps: int,
-        resolutions: list[int],
-        num_channels=256,
-        query_dim=3,
-    ):
-        """
-        Produce similarity maps between image feature maps and 3D query points.
-
-        Args:
-            d_model: Dimension of the image feature maps.
-            n_heads: Number of correlation heads. This splits d_model into n_heads heads.
-            n_feature_maps: Number of feature maps to process.
-            resolutions: List of kernel resolutions for each feature map.
-                Where >1 indicates convolution with that kernel size, 1 indicates a dot
-                product, and 0 indicates dot product without projection first.
-        """
-        super().__init__()
-
-        self.d_model = num_channels
-        self.n_heads = n_heads
-        self.n_feature_maps = n_feature_maps
-        self.resolutions = [max(res, 1) for res in resolutions]
-        self.query_dim = query_dim
-
-        for n_head in n_heads:
-            assert num_channels % n_head == 0, "d_model must be divisible by n_heads"
-        self.C_heads = [num_channels // n_heads for n_heads in n_heads]
-
-        assert (
-            len(self.resolutions) == self.n_feature_maps
-            and len(self.n_heads) == self.n_feature_maps
-            and len(self.C_heads) == self.n_feature_maps
-        ), "Length of resolutions and n_heads must match n_feature_maps"
-
-        self.query_encoder = nn.Sequential(nn.Linear(query_dim, 128), nn.SiLU(), nn.Linear(128, 192), nn.SiLU())
-        init(self.query_encoder[0], nonlinearity="relu")
-        init(self.query_encoder[2], nonlinearity="relu")
-
-        self.query_encoder_p = nn.ModuleList(
-            [nn.Linear(192, n_head * C_head * (res**2)) for res, C_head, n_head in zip(resolutions, self.C_heads, n_heads)]
-        )
-
-        for layer in self.query_encoder_p:
-            init(layer, nonlinearity="linear")
-
-    def forward_fused_conv_sample(
-        self,
-        image_features: list[torch.Tensor],
-        query_points: torch.Tensor,
-        grid_size: list[tuple[int, int]],
-        last_pred_coords: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """
-        Forward pass for the fused convolution + grid sampling kernel.
-
-        Args:
-            image_features: List of feature maps from the backbone, each of shape (B, C, H, W).
-            query_points: 3D query points, shape (B, num_queries, 3).
-            grid_size: List of (gH, gW) output grid sizes for each feature map.
-            last_pred_coords: Last predicted 2D coordinates for each query point, shape (B, num_queries, 2).
-            hidden_state: Global hidden state vector, shape (B, num_queries, 128).
-            image_size: Original image size (height, width) passed into the backbone.
-            feature_extractor: The ImageFeatureExtractor used to extract the features, passed to correct coordinate bias.
-        Returns:
-            Local features around each query point from all feature maps,
-            list of shape (batch_size, num_queries, n_heads, gH, gW).
-        """
-
-        qe = self.query_encoder(query_points)  # (B, num_queries, 512)
-        out_feat = []
-        for i, (feat, gs) in enumerate(zip(image_features, grid_size)):
-            res = self.resolutions[i]
-            n_heads = self.n_heads[i]
-            C_head = self.C_heads[i]
-
-            qe_curr = self.query_encoder_p[i](qe)  # (B, num_queries, n_head * C_head * res^2)
-            qe_curr = qe_curr.unflatten(-1, (n_heads, C_head, res, res))  # (B, num_queries, n_heads, C_head, res, res)
-
-            # Apply coordinate shift correction if feature_extractor is provided
-            pred_coords = last_pred_coords
-
-            out = fused_conv_sample(
-                feature_maps=feat,
-                conv_kernels=qe_curr,
-                query_points=pred_coords,
-                grid_size=gs,
-                sampling_mode="bilinear",
-                padding_mode="border",
-            )  # (B, num_queries, n_heads, gH, gW)
-            out_feat.append(out)
-        return out_feat
-
-    def forward(
-        self,
-        image_features: list[torch.Tensor],
-        query_points: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """
-        Forward pass.
-        Args:
-            image_features: List of image features each with shape (batch_size, self.d_model, H, W) where H and W can vary.
-            query_points: 3D query points, shape (batch_size, num_queries, 3).
-            hidden_state: Global hidden state vector, shape (batch_size, num_queries, 128).
-        Returns:
-            List of similarity maps for each feature level, each with shape (batch_size,
-            num_queries, n_heads, H, W) or if the kernel size is even (batch_size, num_queries, n_heads, H+1, W+1).
-        """
-        qe = self.query_encoder(query_points)  # (B, num_queries, 512)
-
-        corr_maps = []
-        for i, feat in enumerate(image_features):
-            B, _, H, W = feat.shape
-
-            res = self.resolutions[i]
-            n_heads = self.n_heads[i]
-            C_head = self.C_heads[i]
-            # assert (
-            #     C == self.d_model
-            # ), f"Feature map channel dimension {C} does not match d_model {self.d_model}"
-
-            qe_curr: torch.Tensor = self.query_encoder_p[i](qe)  # (B, num_queries, n_head * C_head * res^2)
-
-            if res == 1:
-                # Fast path for 1x1 kernels (dot product)
-                # q: (B, N, h, C)
-                # f: (B, h * C, H, W)
-                if B == 1:
-                    # ONNX export with fixed one batch size
-                    # (1 * N, h, 1, C) @ (1, h, C, H * W) = (N, h, 1, H * W) -> (N, h, H, W)
-
-                    qe_curr = qe_curr.view(-1, n_heads, 1, C_head)  # (B * num_queries, n_heads, 1, C_head)
-                    feat = feat.view(1, n_heads, C_head, H * W)
-
-                    out = qe_curr @ feat  # (N, h, 1, H * W)
-                    out = out.view(1, -1, n_heads, H, W)  # (B, num_queries, n_heads, H, W)
-                else:
-                    qe_curr = qe_curr.view(B, -1, n_heads, C_head)  # (B, num_queries, n_heads, C_head)
-                    feat = feat.view(B, n_heads, C_head, H, W)  # (B, n_heads, C_head, H, W)
-                    out = torch.einsum("bqnc,bnchw->bqnhw", qe_curr, feat)  # (B, num_queries, n_heads, H, W)
-            else:
-                # Formulate as Grouped Convolution
-
-                if False and B == 1:  # TODO: probably not worth it.
-                    # f: (1, h * C, H, W)
-                    # w: (1, N, h * C * res * res)
-                    qe_curr = qe_curr.view(-1, n_heads, C_head, res, res)  # (1 * num_queries, n_heads, C_head, res, res)
-
-                    # Input: (1, C, H, W)
-                    # Weights: (N, C, res, res)
-                    out_heads = []
-                    for h in range(n_heads):
-                        feat_in = feat[:, h * C_head : (h + 1) * C_head, :, :]  # (1, C_head, H, W)
-                        w = qe_curr[:, h, :, :, :]  # (1 * num_queries, C_head, res, res)
-                        out_head = torch.conv2d(feat_in, w, padding=0)  # (1, num_queries, H_out, W_out)
-                        _, _, H_out, W_out = out_head.shape
-                        out_head = out_head.view(1, -1, 1, H_out, W_out)  # (1, num_queries, 1, H_out, W_out)
-                        out_heads.append(out_head)
-                    out = torch.cat(out_heads, dim=2)  # (1, num_queries, n_heads, H_out, W_out)
-
-                else:
-                    # Input: (1, B * n_heads * C_head, H, W)
-                    # Weights: (B * n_heads * num_queries, C_head, res, res)
-                    # Groups: B * n_heads
-
-                    feat_in = feat.view(1, B * n_heads * C_head, H, W)
-                    # Permute kernel to align with groups
-                    w = (
-                        qe_curr.unflatten(-1, (n_heads, C_head, res, res)).movedim(1, 2).flatten(0, 2)
-                    )  # (B * n_heads * num_queries, C_head, res, res)
-
-                    out = nn.functional.conv2d(
-                        feat_in, w, padding=0, groups=B * n_heads
-                    )  # (1, B * n_heads * num_queries, H_out, W_out)
-
-                    _, _, H_out, W_out = out.shape
-
-                    # Reshape back to (B, n_heads, Q, ...) then transpose
-                    out = out.view(B, n_heads, -1, H_out, W_out)  # (B, n_heads, num_queries, H_out, W_out)
-                    out = out.transpose(1, 2)  # (B, Q, n_heads, H_out, W_out)
-                    # Make contiguous to save memory for later reshaping operations
-                    out = out.contiguous()
-
-            corr_maps.append(out)
-
-        return corr_maps

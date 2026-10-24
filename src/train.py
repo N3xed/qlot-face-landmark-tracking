@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from utils.torch.datasets import DataLoader
 from utils.torch.misc import Config, optimizer_to, save, load
 from utils.torch.optim import opt_param_cfg, ParamCfg
-from model import QLOT, LowRankCov2D, Cov2D
+from model import QLOT, Cov
 from torch.utils.tensorboard import SummaryWriter
 from model.utils import LandmarkPrediction, QueryPoints
 from tqdm import tqdm
@@ -62,7 +62,7 @@ class DataLoaders(DataLoadersBase):
         try:
             face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = cfg.batch_sizes
         except:
-            face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = 16, 8, 8, 4
+            face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = 8, 4, 4, 4
             print(f"Using default batch sizes for dataloaders: ({face_synth_bs}, {wflw_bs}, {wflw_v_bs}, {ibug_bs})")
 
         # Derive distinct generators per training loader so their batch-order streams are independent
@@ -80,20 +80,24 @@ class DataLoaders(DataLoadersBase):
             persistent_workers=True,
             generator=_seed(rng),
             stream_idx=0,
+            prefetch_factor=2,
         )
         self.face_synth = DataLoader(
             datasets.face_synth,
             batch_size=face_synth_bs,
-            num_workers=1,
+            num_workers=2,
             persistent_workers=True,
             generator=_seed(rng),
+            prefetch_factor=4,
             stream_idx=1,
         )
         self.wflw = DataLoader(
-            datasets.wflw, batch_size=wflw_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=2
+            datasets.wflw, batch_size=wflw_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=3,
+            prefetch_factor=2,
         )
         self.ibug = DataLoader(
-            datasets.ibug, batch_size=ibug_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=3
+            datasets.ibug, batch_size=ibug_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=3,
+            prefetch_factor=2,
         )
 
         self.wflw_valid = DataLoader(
@@ -312,9 +316,7 @@ def schedule_num_iterations(params: TrainParams, rng: np.random.Generator) -> in
 
 @dataclass(init=False, repr=False)
 class ProcessBatch:
-    acc_l1_loss: torch.Tensor
-    acc_huber_loss: torch.Tensor
-    acc_gnll_loss: torch.Tensor
+    acc_nll_loss: torch.Tensor
     acc_delta_gnll_loss: torch.Tensor
     acc_acceleration_gnll_loss: torch.Tensor
     acc_hconsistency_loss: torch.Tensor
@@ -334,9 +336,7 @@ class ProcessBatch:
         self.params = params
         self.is_viz = is_viz
 
-        self.acc_l1_loss = torch.zeros(1, device=params.device)
-        self.acc_huber_loss = torch.zeros(1, device=params.device)
-        self.acc_gnll_loss = torch.zeros(1, device=params.device)
+        self.acc_nll_loss = torch.zeros(1, device=params.device)
         self.acc_delta_gnll_loss = torch.zeros(1, device=params.device)
         self.acc_acceleration_gnll_loss = torch.zeros(1, device=params.device)
         self.acc_hconsistency_loss = torch.zeros(1, device=params.device)
@@ -350,9 +350,7 @@ class ProcessBatch:
         self.final_idx = None
 
     def iter_tensors(self) -> Iterator[torch.Tensor]:
-        yield self.acc_l1_loss
-        yield self.acc_huber_loss
-        yield self.acc_gnll_loss
+        yield self.acc_nll_loss
         yield self.acc_delta_gnll_loss
         yield self.acc_acceleration_gnll_loss
         yield self.acc_hconsistency_loss
@@ -364,9 +362,7 @@ class ProcessBatch:
 
     def acc_loss(
         self,
-        l1_loss: torch.Tensor,
-        huber_loss: torch.Tensor,
-        gnll_loss: torch.Tensor,
+        nll_loss: torch.Tensor,
         delta_gnll_loss: torch.Tensor,
         acceleration_gnll_loss: torch.Tensor,
         hconsistency_loss: torch.Tensor,
@@ -376,19 +372,16 @@ class ProcessBatch:
             self.batch_loss += batch_loss.detach()
         else:
             self.batch_loss += (
-                1.0 * l1_loss
-                + 1.0 * gnll_loss
+                1.0 * nll_loss
                 + 0.5 * delta_gnll_loss
                 + 0.25 * acceleration_gnll_loss
                 + (4.0 * max(0.0, min(1.0, (self.params.global_step - 2000.0) / 10000.0))) * hconsistency_loss
             )
 
-        self.acc_l1_loss += l1_loss.detach()
-        self.acc_gnll_loss += gnll_loss.detach()
+        self.acc_nll_loss += nll_loss.detach()
         self.acc_delta_gnll_loss += delta_gnll_loss.detach()
         self.acc_acceleration_gnll_loss += acceleration_gnll_loss.detach()
         self.acc_hconsistency_loss += hconsistency_loss.detach()
-        self.acc_huber_loss += huber_loss.detach()
 
     def process(self, batch: Batch, model: QLOT) -> None:
         nqueries = batch.queries.shape[-2]
@@ -438,23 +431,26 @@ class ProcessBatch:
                 curr_batch.queries,
                 iterations=curr_iters,
                 return_sequence=True,
-                store_similarity_maps=False,
                 return_hidden_state=True,
-                prefill_hidden_state=hidden_state,
-                prefill_starting_landmarks=starting_predictions,
+                hidden_state=hidden_state,
+                predictions=starting_predictions,
                 detach_updates=True,
             )
 
             assert preds is not None
 
+            image_height, image_width = curr_batch.image_size
+            preds_pixel = preds.unnormalize_coords(image_width, image_height)
+
+
             # --- TTA Bias Cancellation for Paired Flip Batches ---
-            hconsistency_loss = torch.zeros(1, 1, 1, device=preds.mean.device)  # Default to zero if not computed
+            hconsistency_loss = torch.zeros(1, 1, 1, device=preds_pixel.mean.device)  # Default to zero if not computed
             if batch.dataset.include_flipped:
                 # The batch is interleaved [Original, Flipped, Original, Flipped, ...]
                 W_img = batch.images.shape[-1]
 
                 # 1. Spatial Consistency
-                new_mean = preds.mean.clone()  # Shape: (iters, batch_size, queries, 2)
+                new_mean = preds_pixel.mean.clone()  # Shape: (iters, batch_size, queries, 2)
                 pred_orig = new_mean[:, 0::2].clone()
                 pred_flip = new_mean[:, 1::2].clone()
 
@@ -466,47 +462,30 @@ class ProcessBatch:
                 spatial_hconsistency = (pred_orig - unflipped_mean).square().sum(dim=-1)  # (its, batch/2, queries)
 
                 # 2. Covariance Consistency
-                cov_params = preds.cov.params.clone()  # (iters, batch_size, queries, 3)
+                cov_params = preds_pixel.cov.params.clone()  # (iters, batch_size, queries, 5)
                 cov_orig = cov_params[:, 0::2].clone()
                 cov_flip = cov_params[:, 1::2].clone()
 
-                # Unflip the parameters and negate the correlation (index 2)
+                # Unflip the parameters and negate u_y (index 3) since theta -> -theta under horizontal flip
                 unflipped_cov = cov_flip[:, :, flip_indices, :].clone()
-                unflipped_cov[..., 2] = -unflipped_cov[..., 2]
+                unflipped_cov[..., 3] = -unflipped_cov[..., 3]
 
-                cov_hconsistency = (cov_orig - unflipped_cov).abs().sum(dim=-1)  # L1 on log_sigma_x, log_sigma_y, rho
+                cov_hconsistency = (cov_orig - unflipped_cov).abs().sum(dim=-1)  # L1 on s1, s2, u_x, u_y, w
 
                 hconsistency_loss = spatial_hconsistency + 0.1 * cov_hconsistency
 
             if self.is_viz and frame_i == 0:
                 # For logging
-                self.initial_preds = preds.detach()[-1]
+                self.initial_preds = preds_pixel.detach()[-1]
 
             # --- Composite Iterative Loss ---
 
             target_expanded = curr_batch.labels.expand(curr_iters, -1, -1, -1)  # (iter, batch, queries, 2)
             weights_expanded = curr_batch.weights.expand(curr_iters, -1, -1)  # (iter, batch, queries)
 
-            # 1. Split Loss: L2 for Accuracy, GNLL (detached) for Uncertainty
-            diff = preds.mean - target_expanded
-
-            # L2 Loss
-            l1_loss = (diff.square().sum(dim=-1) + 1e-8).sqrt()  # (iterations, batch, queries)
-            huber_loss = torch.nn.functional.huber_loss(preds.mean.detach(), target_expanded, reduction="none", delta=10.0).sum(
-                dim=-1
-            )  # (iterations, batch, queries)
-
-            # GNLL Loss (Accuracy Detached)
-            # We detach the difference so the mean is not updated by the covariance loss.
-            # The two spatial terms are complementary with non-overlapping jobs. Exactly one side is live in each,
-            # so neither degenerates: with only GNLL where mean and the covariance are coupled, the optimizer can
-            # reduce the loss by inflating Sigma instead of fixing the prediction -- the standard heteroscedastic-NLL
-            # failure mode.
-            gnll_loss = preds.cov.gaussian_negative_log_likelihood(diff.detach())
-
-            l1_loss_weighted = (l1_loss * weights_expanded).sum(dim=-1)  # (iterations, batch)
-            huber_loss_weighted = (huber_loss * weights_expanded).sum(dim=-1)  # (iterations, batch)
-            gnll_loss_weighted = (gnll_loss * weights_expanded).sum(dim=-1)  # (iterations, batch)
+            # NLL Loss
+            nll_loss = preds_pixel.cov.nll_loss(preds_pixel.mean, target_expanded)
+            nll_loss_weighted = (nll_loss * weights_expanded).sum(dim=-1)  # (iterations, batch)
 
             # 2. Temporal GNLL terms (Dynamic Uncertainty)
             # Train coordinate trajectory to be smooth when the covariance is low.
@@ -524,10 +503,10 @@ class ProcessBatch:
             # likelihood, and a unit-consistent rescaling only adds a per-clip constant to the
             # log-det term (zero gradient). The clip-to-clip variation in frame spacing is already
             # carried by the magnitude of the pixel displacement itself.
-            acceleration_gnll_weighted = torch.zeros_like(l1_loss_weighted)
-            delta_gnll_weighted = torch.zeros_like(l1_loss_weighted)
+            acceleration_gnll_weighted = torch.zeros_like(nll_loss_weighted)
+            delta_gnll_weighted = torch.zeros_like(nll_loss_weighted)
 
-            if frame_i > 0 and prev_labels is not None and prev_pred_mean_detached is not None:
+            if False: #frame_i > 0 and prev_labels is not None and prev_pred_mean_detached is not None:
                 assert prev_pred_cov_detached is not None
                 assert isinstance(preds.cov, LowRankCov2D)
 
@@ -615,17 +594,13 @@ class ProcessBatch:
             norm = nqueries * curr_iters / batch.global_weight
             spatial_norm = batch.global_weight / (nqueries * iter_norm * batch.orig_clip_len)
 
-            l1_loss_norm = (l1_loss_weighted * curr_iter_weights).sum(dim=0).mean() * spatial_norm
-            huber_loss_norm = (huber_loss_weighted * curr_iter_weights).sum(dim=0).mean() * spatial_norm
-            gnll_loss_norm = (gnll_loss_weighted).sum(dim=0).mean() / (norm * batch.orig_clip_len)
+            nll_loss_norm = (nll_loss_weighted * curr_iter_weights).sum(dim=0).mean() * spatial_norm
             acceleration_gnll_norm = (acceleration_gnll_weighted).sum(dim=0).mean() / (norm * max(batch.orig_clip_len - 2, 1))
             delta_gnll_norm = (delta_gnll_weighted).sum(dim=0).mean() / (norm * max(batch.orig_clip_len - 1, 1))
             hconsistency_loss_norm = hconsistency_loss.sum(dim=0).mean() / (nqueries * batch.orig_clip_len)
 
             self.acc_loss(
-                l1_loss_norm,
-                huber_loss_norm,
-                gnll_loss_norm,
+                nll_loss_norm,
                 delta_gnll_norm,
                 acceleration_gnll_norm,
                 hconsistency_loss_norm,
@@ -642,7 +617,7 @@ class ProcessBatch:
 
             # For logging
             if frame_i == batch.orig_clip_len - 1:
-                self.final_preds = preds.detach()[-1]
+                self.final_preds = preds_pixel.detach()[-1]
                 self.final_idx = (batch_idx, frame_idx.clone())
 
             # Increment frame index for next iteration
@@ -823,9 +798,7 @@ def train_on_images(dataloaders: list[DataLoader], params: TrainParams, viz: boo
         # Accumulate losses for logging. This needs to happen only after
         # we've synchronized with the default stream (all indivitual streams have finished).
         all_batches.acc_loss(
-            l1_loss=process_batch.acc_l1_loss,
-            huber_loss=process_batch.acc_huber_loss,
-            gnll_loss=process_batch.acc_gnll_loss,
+            nll_loss=process_batch.acc_nll_loss,
             delta_gnll_loss=process_batch.acc_delta_gnll_loss,
             acceleration_gnll_loss=process_batch.acc_acceleration_gnll_loss,
             hconsistency_loss=process_batch.acc_hconsistency_loss,
@@ -916,14 +889,17 @@ def validate(
                 i, batch = batch
 
                 test_batch = QueriedFaceDataset.wrap(batch, device=params.device, query_points=params.query_points.queries)
-                is_show_maps = loader_i == show_loader_i and i == show_i
+                is_show_maps = False # loader_i == show_loader_i and i == show_i
 
                 # Forward pass for the batch
                 res: tuple[LandmarkPrediction, list[torch.Tensor]] | LandmarkPrediction = model(
-                    test_batch.images, test_batch.queries, iterations=VALID_ITERS, return_similarity_maps=is_show_maps
+                    test_batch.images, test_batch.queries, iterations=VALID_ITERS
                 )  # (batch_size, num_queries, 3)
                 preds = res[0] if isinstance(res, tuple) else res
                 res_similarity_maps = res[1] if isinstance(res, tuple) else None
+
+                image_height, image_width = test_batch.image_size
+                preds = preds.unnormalize_coords(image_width, image_height)
 
                 errors = torch.sqrt(
                     torch.sum((preds.mean - test_batch.labels[..., :2]) ** 2, dim=-1)
@@ -1001,33 +977,33 @@ def validate(
         images.append(img)
     tb_writer.add_image("Images/valid", torchvision.utils.make_grid(images, nrow=2), global_step)
 
-    assert len(similarity_maps) != 0
-    assert map_str is not None
-    res_maps = []
+    if len(similarity_maps) != 0:
+        assert map_str is not None
+        res_maps = []
 
-    # Show similarity maps for a single sample.
-    MAP_SIZE = 224
-    for level, m in enumerate(similarity_maps):
-        m, (min_vals, max_vals) = map_to_color(m, norm_per_batch=False, cmap="inferno")
-        m = TF.resize(m, [MAP_SIZE, MAP_SIZE], interpolation=TF.InterpolationMode.BILINEAR, antialias=False)
-        m = TF.pad(m, [0, 20, 0, 0], fill=0)  # Pad top for text overlay
+        # Show similarity maps for a single sample.
+        MAP_SIZE = 224
+        for level, m in enumerate(similarity_maps):
+            m, (min_vals, max_vals) = map_to_color(m, norm_per_batch=False, cmap="inferno")
+            m = TF.resize(m, [MAP_SIZE, MAP_SIZE], interpolation=TF.InterpolationMode.BILINEAR, antialias=False)
+            m = TF.pad(m, [0, 20, 0, 0], fill=0)  # Pad top for text overlay
 
-        # Add text overlay
-        for i in range(m.shape[0]):
-            img = m[i].cpu().permute(1, 2, 0).contiguous().numpy()  # (H, W, C)
-            img = cv2.putText(
-                img,
-                f"{map_str}L{level}H{i} r:{min_vals[i].item():.2f}/{max_vals[i].item():.2f}",
-                (2, 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.3,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-            map_str = ""  # Only show the map_str on the first image
-            res_maps.append(torch.from_numpy(img).permute(2, 0, 1))  # (C, H, W)
-    tb_writer.add_image("Images/sim_maps", torchvision.utils.make_grid(res_maps, nrow=2), global_step)
+            # Add text overlay
+            for i in range(m.shape[0]):
+                img = m[i].cpu().permute(1, 2, 0).contiguous().numpy()  # (H, W, C)
+                img = cv2.putText(
+                    img,
+                    f"{map_str}L{level}H{i} r:{min_vals[i].item():.2f}/{max_vals[i].item():.2f}",
+                    (2, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.3,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                map_str = ""  # Only show the map_str on the first image
+                res_maps.append(torch.from_numpy(img).permute(2, 0, 1))  # (C, H, W)
+        tb_writer.add_image("Images/sim_maps", torchvision.utils.make_grid(res_maps, nrow=2), global_step)
 
 
 @torch.no_grad()
@@ -1109,6 +1085,7 @@ def validate_jitter(
 
                 landmarks = landmarks_list[dl_idx]
                 landmarks_gt = landmarks_gt_list[dl_idx]
+                image_height, image_width = batch.image_size
 
                 hidden_state = None
                 preds: LandmarkPrediction | None = None
@@ -1124,13 +1101,12 @@ def validate_jitter(
                         # jitter, not the startup error.
                         iterations=VALID_ITERS if frame_i == 0 else 1,
                         return_sequence=False,
-                        store_similarity_maps=False,
                         return_hidden_state=True,
-                        prefill_hidden_state=hidden_state,
-                        prefill_starting_landmarks=preds,
+                        hidden_state=hidden_state,
+                        predictions=preds,
                     )
                     assert preds is not None
-                    landmarks[curr_clips_idx, frame_i, :, :] = preds.mean
+                    landmarks[curr_clips_idx, frame_i, :, :] = preds.unnormalize_coords(image_width, image_height).mean
                     landmarks_gt[curr_clips_idx, frame_i, :, :] = frame_batch.labels
 
     # Wait for all streams to finish before computing metrics
@@ -1164,12 +1140,10 @@ def validate_jitter(
 
 def compile_model(model: QLOT):
     print("Compiling model...")
-    # model.feature_extractor.compile()
-    # model.image_feature_correlator.proj_to_kernel.compile(dynamic=True)
-    # model.query_encoder.compile(dynamic=True)
-    # model.image_feature_correlator.compile(dynamic=True)
-    model.encoder.compile(dynamic=True)
-    model.update_predictor.compile(dynamic=True)
+    model.feature_extractor.backbone.compile()
+    model.mixer.compile(dynamic=True)
+    model.context_mlp.compile()
+    model.gru.compile()
 
 
 def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
@@ -1248,15 +1222,14 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
 
                 # Log losses
                 tb_writer.add_scalar("Loss/train", all_batches.batch_loss.item(), params.global_step)
-                tb_writer.add_scalar("Loss/l1", all_batches.acc_l1_loss.item(), params.global_step)
-                tb_writer.add_scalar("Loss/gnll", all_batches.acc_gnll_loss.item(), params.global_step)
+                tb_writer.add_scalar("Loss/nll", all_batches.acc_nll_loss.item(), params.global_step)
                 tb_writer.add_scalar("Loss/delta_gnll", all_batches.acc_delta_gnll_loss.item(), params.global_step)
                 tb_writer.add_scalar("Loss/acceleration_gnll", all_batches.acc_acceleration_gnll_loss.item(), params.global_step)
                 tb_writer.add_scalar("Loss/map_consistency", all_batches.acc_hconsistency_loss.item(), params.global_step)
-                tb_writer.add_scalar("Loss/huber", all_batches.acc_huber_loss.item(), params.global_step)
 
                 nme_list = []
                 cov_max, cov_min, cov_mean, cov_std = [], [], [], []
+                alpha_max, alpha_min, alpha_mean, alpha_std = [], [], [], []
                 with torch.no_grad():
                     # Calculate normalized mean error (NME) over the last batch
                     for pred_pixel, pred_labels in zip(pred_list, labels_list):
@@ -1272,10 +1245,17 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                         nme_v = (errors.mean(dim=-1) / norm_factor).mean()
                         nme_list.append(nme_v)
 
-                        cov_max.append(pred_pixel.cov.max_variance.max())
-                        cov_min.append(pred_pixel.cov.min_variance.min())
-                        cov_mean.append(pred_pixel.cov.max_variance.mean())
-                        cov_std.append(pred_pixel.cov.max_variance.std())
+                        stddev = pred_pixel.cov.scalar_uncertainty.exp()
+                        cov_max.append(stddev.max())
+                        cov_min.append(stddev.min())
+                        cov_mean.append(stddev.mean())
+                        cov_std.append(stddev.std())
+
+                        alpha = pred_pixel.cov.alpha_1
+                        alpha_max.append(alpha.max())
+                        alpha_min.append(alpha.min())
+                        alpha_mean.append(alpha.mean())
+                        alpha_std.append(alpha.std())
 
                     tb_writer.add_scalar("NME/train", torch.stack(nme_list).mean(), params.global_step)
 
@@ -1284,6 +1264,11 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                     tb_writer.add_scalar("Variance/std", torch.stack(cov_std).mean().item(), params.global_step)
                     tb_writer.add_scalar("Variance/min", torch.stack(cov_min).mean().item(), params.global_step)
                     tb_writer.add_scalar("Variance/max", torch.stack(cov_max).mean().item(), params.global_step)
+
+                    tb_writer.add_scalar("Alpha/mean", torch.stack(alpha_mean).mean().item(), params.global_step)
+                    tb_writer.add_scalar("Alpha/std", torch.stack(alpha_std).mean().item(), params.global_step)
+                    tb_writer.add_scalar("Alpha/min", torch.stack(alpha_min).mean().item(), params.global_step)
+                    tb_writer.add_scalar("Alpha/max", torch.stack(alpha_max).mean().item(), params.global_step)
 
                 # Log learning rate
                 current_lr = optimizer.param_groups[0]["lr"]
@@ -1347,7 +1332,7 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                 nme: float = cfg.nme
                 best_nme: float = cfg.best_nme
 
-                if nme <= params.nme_coeff * best_nme:
+                if (nme <= params.nme_coeff * best_nme) and (params.global_step % params.big_validate_every) == 0:
                     save_model = True
                 is_validate = True
 
@@ -1422,10 +1407,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=110, help="Number of training epochs")
     parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps per epoch")
     parser.add_argument("--model-iterations", type=int, default=3, help="Number of model iterations per forward pass")
-    parser.add_argument("--small-validate-every", type=int, default=20, help="Frequency of small validation runs (in steps)")
+    parser.add_argument("--small-validate-every", type=int, default=50, help="Frequency of small validation runs (in steps)")
     parser.add_argument("--log-images-every", type=int, default=20, help="Frequency of logging images to TensorBoard (in steps)")
     parser.add_argument("--save-latest-every", type=int, default=200, help="Frequency of saving latest checkpoint (in steps)")
-    parser.add_argument("--name", type=str, default="infinite-lmk-v4", help="Name of model experiment")
+    parser.add_argument("--name", type=str, default="qlot-v2", help="Name of model experiment")
     parser.add_argument("--run", type=str, default="r0", help="Run identifier for the experiment")
     parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate for optimizer")
     parser.add_argument("--dataset-dir", type=str, required=True, help="Path to datasets directory")
@@ -1503,10 +1488,8 @@ if __name__ == "__main__":
         model.named_parameters(),
         config={
             "query_encoder.*": ParamCfg(lr=lr, weight_decay=0.0),
-            "encoder.corr_feat_head_convs.?.0.log_temp": ParamCfg(weight_decay=0.0),
-            "encoder.image_feature_proj.*": ParamCfg(weight_decay=0.0),
-            "update_predictor.mixer.write_temperature": ParamCfg(weight_decay=0.0),
-            "update_predictor.mixer.residual_weights": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
+            "mixer.wr_temperature": ParamCfg(weight_decay=0.0),
+            "mixer.residual_weights": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
         },
         other_params=[
             # (query_points.parameters(), ParamCfg(lr=args.queries_lr, weight_decay=0.0))
@@ -1570,8 +1553,6 @@ if __name__ == "__main__":
         params.query_steps = args.cycle_query_steps
 
     def weights_filter(state_dict: dict) -> dict:
-        state_dict = QLOT.translate_weights(state_dict)
-
         if args.init_backbone:
             state_dict = QLOT.filter_weights_backbone(state_dict)
         return state_dict
