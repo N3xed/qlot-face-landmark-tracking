@@ -271,7 +271,8 @@ With this factorization:
 1. **Whitened Residual Evaluation:**
    Defining the base-scale-normalized residual $\tilde{\mathbf{e}} = \mathbf{B}^{-1}\mathbf{e} = (e_x / b_x, \, e_y / b_y)^\top$, the rotated projections and Mahalanobis distances reduce to the standard unit-scale formulas applied to $\tilde{\mathbf{e}}$:
    $$\begin{pmatrix} \tilde{e}_\parallel \\ \tilde{e}_\perp \end{pmatrix} = \mathbf{R}(\theta)^\top \tilde{\mathbf{e}}, \qquad d_1(\mathbf{e}) = \sqrt{(\tilde{e}_\parallel e^{-s_1})^2 + (\tilde{e}_\perp e^{-s_2})^2 + \epsilon^2}, \qquad d_2(\mathbf{e}) = \sqrt{\tilde{e}_x^2 + \tilde{e}_y^2 + \epsilon^2}$$
-   When $(b_x, b_y) = (2/W, 2/H)$ in normalized $[-1, 1]^2$ coordinates, $\tilde{\mathbf{e}}$ is identical to the pixel-space residual $\mathbf{e}_{\text{px}}$, so the NLL loss (omitting the constant Jacobian offset $\log(b_x b_y)$) and all parameter gradients are identical to evaluating the unscaled loss in pixel coordinates.
+   When $(b_x, b_y) = (2/W, 2/H)$ in normalized $[-1, 1]^2$ coordinates, $\tilde{\mathbf{e}}$ is identical to the pixel-space residual $\mathbf{e}_{\text{px}}$, and the NLL includes the Jacobian term $\log(b_x b_y)$:
+   $$\mathcal{L}_{\text{MoL}}(\mathbf{e}) = -\operatorname{logaddexp}\Big(\log\alpha_1 - s_{\det, 1} - d_1(\mathbf{e}), \;\; \log\alpha_2 - d_2(\mathbf{e})\Big) + \log(2\pi b_x b_y)$$
 
 2. **Closed-Form Coordinate Scaling Without Eigendecomposition:**
    Under any axis-aligned coordinate transformation $\mathbf{e}' = \mathbf{S}\mathbf{e}$ with $\mathbf{S} = \operatorname{diag}(c_x, c_y)$ (e.g., scaling from normalized $[-1, 1]^2$ coordinates to pixel coordinates via $(c_x, c_y) = (W/2, H/2)$ or vice versa), the covariance matrices transform as $\boldsymbol{\Sigma}_k' = \mathbf{S}\boldsymbol{\Sigma}_k\mathbf{S}^\top$. Because both $\mathbf{S}$ and $\mathbf{B}$ are diagonal, they commute and compose directly into a new base scale:

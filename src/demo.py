@@ -11,7 +11,6 @@ from kornia.geometry.transform.flips import hflip
 import data
 from model import QLOT
 import model as my_model
-from model.lmk_features import LearnedTempSoftShrink
 import cv2
 import queue
 import logging
@@ -165,12 +164,12 @@ class Runner:
             queries.to(self.device),
             iterations=self.iterations,
             return_hidden_state=True,
-            prefill_hidden_state=self.last_hidden_state if forward_hidden else None,
-            prefill_starting_landmarks=self.last_predictions if forward_predictions else None,
-            gating_radius=gating_radius,
-            gating_cutoff=gating_cutoff,
-            store_similarity_maps=store_similarity_maps,
-            use_naive_correlation=naive_correlation,
+            hidden_state=self.last_hidden_state if forward_hidden else None,
+            predictions=self.last_predictions if forward_predictions else None,
+            # gating_radius=gating_radius,
+            # gating_cutoff=gating_cutoff,
+            # store_similarity_maps=store_similarity_maps,
+            # use_naive_correlation=naive_correlation,
             landmarks_to_mask=self.lmk_mask.to(self.device) if self.lmk_mask is not None else None,
         )
 
@@ -188,6 +187,7 @@ class Runner:
         else:
             self.last_predictions.mean.copy_(predictions.mean)
             self.last_predictions.cov.params.copy_(predictions.cov.params)
+        preds_pixel = predictions.unnormalize_coords(224, 224)
 
         # Test time augmentation with horizontal flip.
         # We flip the input image, and flip the predicted landmarks back, then average the
@@ -199,10 +199,10 @@ class Runner:
                 queries.to(self.device)[:, self.flip_indices.cuda(), :],
                 iterations=self.iterations,
                 return_hidden_state=True,
-                prefill_hidden_state=self.last_hidden_state2,
-                prefill_starting_landmarks=self.last_predictions2,
-                gating_radius=gating_radius,
-                gating_cutoff=gating_cutoff,
+                hidden_state=self.last_hidden_state2,
+                predictions=self.last_predictions2,
+                # gating_radius=gating_radius,
+                # gating_cutoff=gating_cutoff,
             )
 
             if self.last_hidden_state2 is None:
@@ -215,22 +215,21 @@ class Runner:
                 self.last_predictions2.mean.copy_(pred2.mean)
                 self.last_predictions2.cov.params.copy_(pred2.cov.params)
 
-            pred2_mean = pred2.mean.clone()
-            pred2_mean[..., 0] = image_det.shape[-1] - 1.0 - pred2.mean[..., 0]
-            predictions = predictions.clone()
-            predictions.mean = 0.5 * (predictions.mean + pred2_mean)
+            pred2_mean = pred2.unnormalize_coords(224, 224).mean.clone()
+            pred2_mean[..., 0] = image_det.shape[-1] - 1.0 - pred2_mean[..., 0]
+            preds_pixel.mean = 0.5 * (preds_pixel.mean + pred2_mean)
 
         end_time = cv2.getTickCount()
         duration_ms = (end_time - start_time) / cv2.getTickFrequency() * 1000.0
 
-        self.min_variance = min(self.min_variance, predictions.cov.min_variance.min().item())
-        self.max_variance = max(self.max_variance, predictions.cov.max_variance.max().item())
+        self.min_variance = min(self.min_variance, preds_pixel.cov.variance.min().item())
+        self.max_variance = max(self.max_variance, preds_pixel.cov.variance.max().item())
         # Exponential moving average of the mean max variance.
         self.mean_variance = (
             1.0 - variance_ema_alpha
-        ) * self.mean_variance + variance_ema_alpha * predictions.cov.max_variance.mean().item()
+        ) * self.mean_variance + variance_ema_alpha * preds_pixel.cov.variance.mean().item()
 
-        preds = predictions[0].clone()
+        preds = preds_pixel[0].clone()
         preds.mean = preds.mean.detach().cpu()
         preds.cov = preds.cov.detach().to("cpu")
 
@@ -289,7 +288,7 @@ class Sample:
         draw_cov_ellipse: bool,
     ) -> AnnotationPrimitives | None:
         landmarks_2d = self.predictions.mean.cpu().numpy()  # Shape: (num_queries, 2)
-        cov_2d = self.predictions.cov.to_matrix().cpu().numpy()  # Shape: (num_queries, 2, 2)
+        cov_2d = self.predictions.cov.as_cov2d_matrix().cpu().numpy()  # Shape: (num_queries, 2, 2)
 
         max_variance = np.log(max(self.max_var, 1e-12))
         min_variance = np.log(max(self.min_var, 1e-12))
@@ -613,7 +612,7 @@ class Tracker:
         return value / (1.0 + abs(value) / max_value)
 
     def track(self, sample: Sample):
-        next_var = sample.predictions.cov.generalized_variance.mean().item()
+        next_var = sample.predictions.cov.variance.mean().item()
 
         if self._reinit_mean_var_next_frame or self.mean_var is None:
             self.mean_var = next_var
@@ -813,7 +812,6 @@ class Gui:
 
         self.curr_sample: Sample | None = None
         self.curr_frame: NDArray | None = None
-        self.act: None | list[LearnedTempSoftShrink] = None
 
     @torch.inference_mode()
     def _process_frames(self):
@@ -1041,7 +1039,7 @@ class Gui:
             _, self.show_output_graph = imgui.checkbox("Output", self.show_output_graph)
 
             
-            if self.show_bypass_fraction and self.model.update_predictor.mixer.bypass_fraction is not None:
+            if self.show_bypass_fraction:
                 if self.store_similarity_maps:
                     frac = self.model.update_predictor.mixer.bypass_fraction.detach()[0, self.selected_query_idx].flatten().cpu().numpy()
                 else:
@@ -1135,7 +1133,7 @@ class Gui:
 
             imgui.label_text(
                 "##temps",
-                f"Temps: {torch.exp2(self.model.update_predictor.mixer.write_temperature.detach().cpu().flatten() / 3.0).numpy()}",
+                f"Temps: {torch.exp2(self.model.mixer.wr_temperature.detach().cpu().flatten() / 3.0).numpy()}",
             )
 
         imgui.end()
@@ -1194,7 +1192,7 @@ class Gui:
                 self.runner.model = None
 
             def weights_filter(state_dict: dict) -> dict:
-                state_dict = my_model.QLOT.translate_weights(state_dict)
+                # state_dict = my_model.QLOT.translate_weights(state_dict)
                 return state_dict
 
             def load_queries(state_dict: dict):

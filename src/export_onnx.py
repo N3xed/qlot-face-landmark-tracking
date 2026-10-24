@@ -10,7 +10,7 @@ import json
 # When running from src/, local modules are available
 from model.detector import QLOT
 from model.utils import LandmarkPrediction, NUM_PREDS_PARAMS
-from model.cov import LowRankCov2D
+from model.cov import Cov
 import argparse
 
 try:
@@ -60,10 +60,8 @@ class OnnxWrapper(nn.Module):
         self,
         image,
         query_points,
-        gating_cutoff,
-        gating_radius,
         prefill_hidden_state,
-        prefill_starting_landmarks
+        prefill_starting_landmarks,
     ):
         if self.fixed_query_points is not None:
             # Ignore the input and use the baked-in query points instead.
@@ -78,29 +76,38 @@ class OnnxWrapper(nn.Module):
 
         init_pred = LandmarkPrediction.from_tensor(
             prefill_starting_landmarks,
-            cov_type=LowRankCov2D
+            cov_type=Cov
         )
         
-        predictions = self.model(
+        preds, out_hidden_state = self.model(
             image=image,
             query_points=query_points,
-            gating_radius=gating_radius,
-            gating_cutoff=gating_cutoff,
+            hidden_state=prefill_hidden_state,
+            predictions=init_pred,
             iterations=1,
             return_sequence=False,
-            store_similarity_maps=False,
-            prefill_hidden_state=prefill_hidden_state,
-            prefill_starting_landmarks=init_pred,
             return_hidden_state=True,
             return_tensor_predictions=True, 
-            detach_updates=False,
-            force_cov_gating=True,
-            use_naive_correlation=True,
+            detach_updates=True,
             landmarks_to_mask=landmarks_to_mask,
         )
-        
-        pred, hidden_state = predictions
-        return pred, hidden_state
+        return preds, out_hidden_state
+
+def _add_init_hidden_state(output_path: str, init_hidden_state: torch.Tensor) -> None:
+    """Store the model's learned initial hidden state as an ONNX initializer.
+
+    This allows runtime wrappers like OnnxQLOT to initialize the GRU hidden
+    state using the trained Parameter rather than falling back to zeros.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    model = onnx.load(output_path)
+    arr = init_hidden_state.detach().cpu().to(torch.float32).numpy()
+    tensor = numpy_helper.from_array(arr, name="init_hidden_state")
+    model.graph.initializer.append(tensor)
+    onnx.save(model, output_path)
+
 
 def _convert_export_to_fp16(output_path: str, keep_io_fp32: bool = True) -> None:
     if convert_float_to_float16 is None:
@@ -164,16 +171,17 @@ def export_onnx(
     if checkpoint_path:
         print(f"Loading checkpoint from {checkpoint_path}...")
         try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             # Handle state dict (sometimes wrapped in 'state_dict' key or PL wrapper)
             if "model_state_dict" in checkpoint:
                 state_dict = checkpoint["model_state_dict"]
+            elif "state_dict" in checkpoint:
+                state_dict = checkpoint["state_dict"]
             else:
                 state_dict = checkpoint
-            state_dict = QLOT.translate_weights(state_dict)
-                
+
             # Clean up PL keys if needed (remove "model." prefix if present and not needed, 
-            # as ContinuousLandmarkDetector expects keys without "model." if it wasn't wrapped)
+            # as QLOT expects keys without "model." if it wasn't wrapped)
             new_state_dict = {}
             msg_prefix = "model."
             for k, v in state_dict.items():
@@ -197,8 +205,6 @@ def export_onnx(
         param.requires_grad = False
     
     image_size = 224
-    print(f"Baking grids for image size {image_size}x{image_size}...")
-    model.bake_grids((image_size, image_size))
 
     # Dummy inputs for tracing (using B=1, Q=num_queries)
     batch_size = 1
@@ -252,8 +258,6 @@ def export_onnx(
     print("Creating dummy inputs...")
     image = torch.randn(batch_size, 3, image_size, image_size, device=device)
     query_points = torch.randn(batch_size, num_queries, 3, device=device)
-    gating_cutoff = torch.tensor(0.05, device=device)
-    gating_radius = torch.tensor(1.0, device=device)
     prefill_hidden_state = torch.randn(batch_size, num_queries, gru_hidden_dim, device=device)
     prefill_starting_landmarks = torch.randn(
         batch_size,
@@ -265,10 +269,8 @@ def export_onnx(
     input_names = [
         "image",
         "query_points",
-        "gating_cutoff",
-        "gating_radius",
         "prefill_hidden_state",
-        "prefill_starting_landmarks"
+        "prefill_starting_landmarks",
     ]
     output_names = ["predictions", "hidden_state"]
 
@@ -276,8 +278,6 @@ def export_onnx(
     dynamic_axes = {
         "image": {},
         "query_points": {1: num_queries_dim},
-        "gating_cutoff": {},
-        "gating_radius": {},
         "prefill_hidden_state": {1: num_queries_dim},
         "prefill_starting_landmarks": {1: num_queries_dim},
     }
@@ -296,7 +296,7 @@ def export_onnx(
     try:
         torch.onnx.export(
             wrapper,
-            (image, query_points, gating_cutoff, gating_radius, prefill_hidden_state, prefill_starting_landmarks),
+            (image, query_points, prefill_hidden_state, prefill_starting_landmarks),
             output_path,
             input_names=input_names,
             output_names=output_names,
@@ -307,6 +307,8 @@ def export_onnx(
             optimize=True,
             report=False
         )
+
+        _add_init_hidden_state(output_path, model.init_hidden_state)
 
         if fixed_query_points is not None:
             _prune_unused_inputs(output_path, input_names)

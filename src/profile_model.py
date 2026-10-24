@@ -153,7 +153,7 @@ class PyTorchProfiler:
         if self.model_path.exists():
             try:
                 # Use project's load utility or standard torch load
-                checkpoint = torch.load(self.model_path, map_location=self.device)
+                checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
 
                 # Handle different checkpoint formats
                 if isinstance(checkpoint, dict):
@@ -208,8 +208,6 @@ class PyTorchProfiler:
                     iterations=iterations,
                     return_sequence=False,
                     return_tensor_predictions=True,
-                    force_cov_gating=True,
-                    use_naive_correlation=True,
                 )
 
         wrapper = Wrapper(self.model)
@@ -227,17 +225,35 @@ class PyTorchProfiler:
 
         # 3. Component Breakdown
         # We define specific module paths to categorize FLOPs/Params
-
         components = {
-            "Backbone": ["model.feature_extractor.backbone", "model.feature_extractor.global_proj"],
-            "FPN": ["model.feature_extractor.projections", "model.feature_extractor.fusion_conv"],
-            "Correlation": ["model.image_feature_correlator"],  # Includes query_encoder (we'll subtract later)
-            "Update Predictor": ["model.update_predictor"],
-            "Feature Encoder": ["model.encoder"],
+            "Backbone": ["model.feature_extractor.backbone"],
+            "Feature Extraction": [
+                "model.feature_extractor.proj",
+                "model.feature_extractor.down_proj",
+                "model.feature_extractor.fusion_conv",
+                "model.feature_extractor.global_pool",
+            ],
             "Query Encoding": [
-                "model.encoder.query_encoder",
-                "model.image_feature_correlator.query_encoder",
-                "model.image_feature_correlator.query_encoder_p",
+                "model.query_encoder",
+                "model.query_enc_mlp",
+                "model.global_feat_proj",
+            ],
+            "Local Sampling": ["model.sampler"],
+            "Context Encoding": [
+                "model.kin_encoder",
+                "model.vis_summary_proj",
+                "model.context_mlp",
+                "model.context_norm",
+                "model.vision_feat_mlp",
+                "model.hidden_norm",
+            ],
+            "Update Predictor": [
+                "model.mixer",
+                "model.gate_proj",
+                "model.gru",
+                "model.pred_head",
+                "model.coord_proj",
+                "model.cov_proj",
             ],
         }
 
@@ -249,21 +265,7 @@ class PyTorchProfiler:
             for prefix in prefixes:
                 comp_flops[comp] += flops_by_module.get(prefix, 0)
 
-        # Fix overlaps for FLOPs (Correlation includes Query Encoder)
-        q_enc_flops = flops_by_module.get("model.image_feature_correlator.query_encoder", 0)
-        if q_enc_flops > 0:
-            comp_flops["Correlation"] = max(0, comp_flops["Correlation"] - q_enc_flops)
-        q_enc_flops = flops_by_module.get("model.image_feature_correlator.query_encoder_p", 0)
-        if q_enc_flops > 0:
-            comp_flops["Correlation"] = max(0, comp_flops["Correlation"] - q_enc_flops)
-        q_enc_flops_2 = flops_by_module.get("model.encoder.query_encoder", 0)
-        if q_enc_flops_2 > 0:
-            comp_flops["Feature Encoder"] = max(0, comp_flops["Feature Encoder"] - q_enc_flops_2)
-
         # Aggregate Params
-        # Note: We need to use the same logic (finding modules by name)
-        # But 'model.feature_extractor.backbone' corresponds to self.model.feature_extractor.backbone
-
         module_dict = dict(self.model.named_modules())
         # Add "model." prefix to keys to match our component list
         module_dict = {f"model.{k}" if k else "model": v for k, v in module_dict.items()}
@@ -272,58 +274,14 @@ class PyTorchProfiler:
             for prefix in prefixes:
                 if prefix in module_dict:
                     mod = module_dict[prefix]
-                    # We use recurse=True to get all params in this module
                     comp_params[comp] += sum(p.numel() for p in mod.parameters())
-
-        # Fix overlaps for Params
-        if "model.image_feature_correlator.query_encoder" in module_dict:
-            q_enc_params = sum(p.numel() for p in module_dict["model.image_feature_correlator.query_encoder"].parameters())
-            comp_params["Correlation"] = max(0, comp_params["Correlation"] - q_enc_params)
-        if "model.image_feature_correlator.query_encoder_p" in module_dict:
-            q_enc_params = sum(p.numel() for p in module_dict["model.image_feature_correlator.query_encoder_p"].parameters())
-            comp_params["Correlation"] = max(0, comp_params["Correlation"] - q_enc_params)
-        if "model.encoder.query_encoder" in module_dict:
-            q_enc_params_2 = sum(p.numel() for p in module_dict["model.encoder.query_encoder"].parameters())
-            comp_params["Query Encoding"] = max(0, comp_params["Query Encoding"] - q_enc_params_2)
 
         # Fill in 'Other'
         known_flops = sum(comp_flops.values())
         comp_flops["Other"] = max(0, total_flops - known_flops)
 
-        # For params, we might double count if we aren't careful, but here we sum disjoint sets + fixed overlap.
-        # But wait, named_modules() includes parents and children.
-        # If I sum backbone params, then sum feature_extractor params, I double count.
-        # My components list is designed to be disjoint (Backbone, Projections, Correlation, Update, QueryEnc).
-        # So summing them should be fine.
-
         known_params = sum(comp_params.values())
         comp_params["Other"] = max(0, total_params - known_params)
-
-        # 4. Bandwidth Estimation
-        # Sizes in bytes (FP32 = 4 bytes)
-        input_size = int(np.prod(self.image_shape) * 4)
-        # Backbone output: 128 channels, H/32, W/32 (approx for HGNet stride 32) -> 7x7 at 224
-        # Based on ARCHITECTURE.md, feature extractor output is [B, 128, 56, 56] (stride 4)
-        # and there's a pooling to global context.
-        # Actually checking code:
-        # feature_extractor outputs [B, 128, 56, 56]
-        feat_size = int(B * 128 * (H // 4) * (W // 4) * 4)
-
-        # Correlation: [B, Q, Heads, H_feat, W_feat]
-        # Q=98, Heads=4, H=56, W=56
-        corr_size = int(B * self.num_queries * 4 * (H // 4) * (W // 4) * 4)
-
-        # GRU State: [B, Q, 128]
-        gru_size = int(B * self.num_queries * 128 * 4)
-
-        # Simple bandwidth model: Read Input + Write Feats + Read Feats + Write Corr + Read Corr + GRU RW
-        # This is a lower bound estimate per frame
-        est_bw_bytes = (
-            input_size  # Read Image
-            + feat_size * 2  # Write + Read Features
-            + corr_size * 2  # Write + Read Correlation Maps (expensive!)
-            + gru_size * 2 * 3  # GRU Read/Write per iteration (x3)
-        )
 
         # --- Printing ---
         print_box_header("FACE LANDMARK DETECTOR PROFILE REPORT")

@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 from typing import Any
 import math
+import torch.nn.functional as F
 
 from .feature_extractor import ImageFeatureExtractor
 from .update_predictor import PhaseModulatedPE, LowRankWriteReadMixer, HeadedLinear, GRU, logit
-from .lmk_features import LmkFeatureEncoder, LocalPatchSampler
+from .lmk_features import LocalPatchSampler
 from .cov import Cov
 from .utils import (
     FlushStream,
@@ -38,63 +39,60 @@ class QLOT(nn.Module):
         self.coord_min_max = (-2.0, 2.0)
 
         self.hidden_dim = 128
+        self.sample_res = 5
+        self.context_dim = 192
+
+        # Query points
         self.query_encoder = PhaseModulatedPE(in_dims=3, num_fourier_freq=16, num_phase_mod_freq=8, tau=0.03)
 
         self.query_pre_enc_dim = self.query_encoder.out_dims
-        self.query_enc_dim = 96
+        self.query_enc_dim = 256 - self.context_dim
         self.query_enc_mlp = nn.Sequential(
-            nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, self.query_enc_dim), nn.SiLU()
+            nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, 256), nn.RMSNorm(256)
         )
         init(self.query_enc_mlp[0], nonlinearity="relu")
         init(self.query_enc_mlp[2], nonlinearity="relu")
 
-        self.feature_extractor = ImageFeatureExtractor(pretrained=feature_extractor_pretrained, stream_safe=True)
-
-        self.init_hidden_state = nn.Parameter(torch.randn(1, 1, self.hidden_dim) / math.sqrt(self.hidden_dim))
-
-        context_dim = self.feature_extractor.global_channels
-        self.global_feat_proj = nn.Sequential(
-            nn.Linear(context_dim, context_dim),
-            nn.RMSNorm(context_dim),
-        )
-        init(self.global_feat_proj[0], nonlinearity="linear")
-
-        kin_dim = 64
-        self.kin_encoder = nn.Sequential(nn.Linear(NUM_PREDS_PARAMS, kin_dim), nn.RMSNorm(kin_dim), nn.SiLU())
-        init(self.kin_encoder[0], nonlinearity="relu")
-
-        total_map_feat = sum(c for c in self.feature_extractor.map_channels)
-        vis_summary_dim = 128
-
-        self.vis_summary_proj = nn.Sequential(nn.Linear(total_map_feat, vis_summary_dim), nn.RMSNorm(vis_summary_dim), nn.SiLU())
-        init(self.vis_summary_proj[0], nonlinearity="relu")
-
-        context_in_dim = kin_dim + vis_summary_dim + self.query_enc_dim
-        self.context_mlp = nn.Sequential(
-            nn.Linear(context_in_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, context_dim),
-        )
-        init(self.context_mlp[0], nonlinearity="relu")
-        init(self.context_mlp[2], nonlinearity="relu")
-
-        self.context_norm = nn.RMSNorm(context_dim)
-
         # Flip y and z axes to match image coordinates
         self.register_buffer("queries_transform", torch.tensor([1.0, -1.0, -1.0], dtype=torch.float32), persistent=False)
 
+        # Backbone
+        self.feature_extractor = ImageFeatureExtractor(pretrained=feature_extractor_pretrained, stream_safe=False)
+
+        # Hidden state init
+        self.init_hidden_state = nn.Parameter(torch.randn(1, 1, self.hidden_dim) / math.sqrt(self.hidden_dim))
+
+        # Global features
+        self.global_feat_proj = nn.Sequential(
+            nn.Linear(self.feature_extractor.global_channels, self.context_dim),
+            nn.RMSNorm(self.context_dim),
+        )
+        init(self.global_feat_proj[0], nonlinearity="linear")
+
+        # Last predictions encoding
+        kin_dim = 64
+        self.kin_encoder = nn.Sequential(
+            nn.Linear(NUM_PREDS_PARAMS, kin_dim), nn.RMSNorm(kin_dim), nn.SiLU(), nn.Linear(kin_dim, self.context_dim)
+        )
+        init(self.kin_encoder[0], nonlinearity="relu")
+        init(self.kin_encoder[3], nonlinearity="linear")
+
+        # Local patch sampling
+        self.sampler = LocalPatchSampler(
+            map_channels=self.feature_extractor.map_channels, sample_res=5, context_dim=self.context_dim
+        )
+        total_vis_feat = sum(c + self.sampler.out_corr_dims for c in self.feature_extractor.map_channels)
+
         self.vision_feat_mlp = nn.Sequential(
-            nn.Linear(total_map_feat + context_dim, 256),
-            nn.RMSNorm(256),
+            nn.Linear(total_vis_feat + self.context_dim, 256),
             nn.SiLU(),
         )
         init(self.vision_feat_mlp[0], nonlinearity="relu")
-
-        self.sampler = LocalPatchSampler(map_channels=self.feature_extractor.map_channels, sample_res=3)
+        self.context_norm = nn.RMSNorm(self.context_dim, elementwise_affine=False)
 
         self.mixer = LowRankWriteReadMixer(
             read_dim=self.query_enc_dim + self.hidden_dim,
-            write_dim=context_dim,
+            write_dim=self.context_dim,
             value_in_dim=256,
             value_dim=256,
             out_dim=256,
@@ -104,7 +102,7 @@ class QLOT(nn.Module):
             enable_spread=False,
         )
 
-        self.gate_proj = nn.Linear(self.hidden_dim + context_dim, 2 * self.hidden_dim)
+        self.gate_proj = nn.Linear(self.hidden_dim, 2 * self.hidden_dim)
         nn.init.kaiming_normal_(self.gate_proj.weight, nonlinearity="sigmoid")  # type: ignore
         with torch.no_grad():
             # Scale up, since we split into 2 gates.
@@ -248,10 +246,14 @@ class QLOT(nn.Module):
         image_feature_maps, context_feat = self.feature_extractor(image)
 
         query_pre_enc = self.query_encoder(query_points)  # Shape: (batch_size, num_queries, query_pre_enc_dim)
-        query_enc = self.query_enc_mlp(query_pre_enc)  # Shape: (batch_size, num_queries, query_enc_dim)
+        query_enc: torch.Tensor = self.query_enc_mlp(query_pre_enc)  # Shape: (batch_size, num_queries, 256)
+        query_enc, query_enc_ctx = query_enc.split(
+            (self.query_enc_dim, self.context_dim), dim=-1
+        )  # query_enc_ctx: (batch_size, num_queries, context_dim), query_enc: (batch_size, num_queries, query_enc_dim)
 
         context_feat = self.global_feat_proj(context_feat)
         context_feat = context_feat.unsqueeze(1).expand(batch_size, num_queries, -1)  # (batch_size, num_queries, context_dim)
+        context_feat = context_feat + query_enc_ctx  # Fuse with query encoding
 
         last_hidden = hidden_state
         last_coords = predictions.mean
@@ -264,39 +266,34 @@ class QLOT(nn.Module):
                 # Detach coordinates from last iteration like RAFT.
                 last_coords = last_coords.detach()
 
+            # Process context features
+            kin_enc = self.kin_encoder(torch.cat([last_coords, Cov(last_cov).as_bounded_params(), last_delta * 10.0], dim=-1))
+            curr_context = self.context_norm(context_feat + kin_enc)
+
             # Lookup local features at each coord
             warped_features = self.sampler(
-                coords=last_coords, feature_maps=image_feature_maps  # Use (x, y) for lookup
+                coords=last_coords, feature_maps=image_feature_maps, context=curr_context
             )  # Shape: list of (batch_size, num_queries, C_i)
-            vis_feat = torch.cat(warped_features, dim=-1)  # (batch_size, num_queries, total_map_feat)
-
-            # Process context features
-
-            vis_summary = self.vis_summary_proj(vis_feat)  # (batch_size, num_queries, vis_summary_dim)
-            kin_enc = self.kin_encoder(torch.cat([last_coords, Cov(last_cov).as_bounded_params(), last_delta * 10.0], dim=-1))
-            context_in = torch.cat([kin_enc, vis_summary, query_enc], dim=-1)
-
-            context_feat = context_feat + self.context_mlp(context_in)  # (batch_size, num_queries, context_dim)
-            context_feat = self.context_norm(context_feat)
+            vis_feat = torch.cat([f for t in warped_features for f in t], dim=-1)  # (batch_size, num_queries, total_map_feat)
 
             normed_hidden_state = self.hidden_norm(last_hidden)  # (batch_size, num_queries, hidden_dim)
             read_feat = torch.cat(
                 [normed_hidden_state, query_enc], dim=-1
             )  # (batch_size, num_queries, hidden_dim + query_enc_dim)
 
-            map_feat = torch.cat([vis_feat, context_feat], dim=-1)
+            map_feat = torch.cat([vis_feat, curr_context], dim=-1)
             map_feat = self.vision_feat_mlp(map_feat)
 
             # Mix features
             mixed = self.mixer(
-                write_feat=context_feat,
+                write_feat=curr_context,
                 read_feat=read_feat,
                 value_feat=map_feat,
                 key_padding_mask=attn_mask,
             )  # (batch_size, num_queries, hidden_dim)
             candidate_feat, gate_feat = mixed.chunk(2, dim=-1)  # (batch_size, num_queries, hidden_dim) each
 
-            gate_feat: torch.Tensor = torch.cat([gate_feat, context_feat], dim=-1)
+            gate_feat: torch.Tensor = F.silu(gate_feat)
             gate_feat = self.gate_proj(gate_feat)  # (batch_size, num_queries, 2 * hidden_dim)
             gate_feat = gate_feat.sigmoid()
             reset, update = gate_feat.chunk(2, dim=-1)

@@ -23,7 +23,6 @@ demo running on single-threaded WebAssembly.
 ```
 src/            Training, evaluation, demo, and ONNX export code
   model/        Model definition (feature extractor, detector, update predictor, covariance, ...)
-  kernels/      Fused Conv2D+GridSample Triton kernel (only for training)
   utils/        Dataset loaders, training utilities, visualization
   notebooks/    Evaluation and exploration notebooks
 data/           Canonical landmark layouts and query-point presets

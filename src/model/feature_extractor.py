@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from kernels.fused_conv_sample import fused_conv_sample
 from itertools import pairwise
 from .utils import init, StreamSafeBatchNorm
 

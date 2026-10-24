@@ -3,7 +3,7 @@ import math
 from dataclasses import dataclass
 from torch import nn
 import torch.nn.functional as F
-from typing import Literal
+from typing import ClassVar, Literal
 
 NUM_PREDS_COV_PARAMS = 5
 
@@ -47,12 +47,15 @@ class Cov:
 
     Attributes:
         params: Tensor of shape (..., 5) containing:
-            - s_1, s_2: Log semi-axes of the outlier ellipse relative to `xy_scale`.
+            - s_1, s_2: Log semi-axes of the outlier ellipse relative to `xy_scale_total`.
             - u_x, u_y: Unnormalized direction vector offset from (1, 0) to compute theta.
             - w: Logit of the mixture weight alpha_1 for the outlier branch.
-        xy_scale: 2D base (inlier) scale `(scale_x, scale_y)` along the x- and y-axes
+        xy_scale: Coordinate-frame scale `(scale_x, scale_y)` along the x- and y-axes
             (e.g., `(1.0, 1.0)` in pixel space or `(2 / W, 2 / H)` in `[-1, 1]` normalized space).
+            Combined with the class constant `base_scale` to form `xy_scale_total`.
     """
+
+    base_scale: ClassVar[float] = 0.5
 
     params: torch.Tensor  # Shape (..., 5) containing s_1, s_2, u_x, u_y, w
     xy_scale: tuple[float, float] = (1.0, 1.0)
@@ -66,6 +69,10 @@ class Cov:
             self.xy_scale = (s, s)
         else:
             self.xy_scale = (float(self.xy_scale[0]), float(self.xy_scale[1]))
+
+    @property
+    def xy_scale_total(self) -> tuple[float, float]:
+        return (self.xy_scale[0] * self.base_scale, self.xy_scale[1] * self.base_scale)
 
     @property
     def s1(self) -> torch.Tensor:
@@ -105,7 +112,7 @@ class Cov:
         Returns:
             Negative log-likelihood of shape [B, K].
         """
-        scale_x, scale_y = self.xy_scale
+        scale_x, scale_y = self.xy_scale_total
         e = gt_xy - pred_xy
         ex = e[..., 0] / scale_x
         ey = e[..., 1] / scale_y
@@ -131,15 +138,15 @@ class Cov:
         d1 = torch.sqrt((e_para * torch.exp(-s1)).square() + (e_perp * torch.exp(-s2)).square() + self.eps**2)
         s_det_1 = s1 + s2  # 0.5 * log(det(Sigma_1)) since det(R) == 1
 
-        # Mixture Negative Log-Likelihood via logaddexp
-        log_2pi = math.log(2.0 * math.pi)
+        # Mixture Negative Log-Likelihood via logaddexp (including log|det(B)| = log(scale_x * scale_y) Jacobian)
+        log_norm = math.log(2.0 * math.pi * scale_x * scale_y)
 
         log_alpha1 = -F.softplus(-self.w)
         log_alpha2 = -F.softplus(self.w)
 
         term1 = log_alpha1 - s_det_1 - d1
         term2 = log_alpha2 - d2  # s_det_2 is zero, so omitted
-        nll = -torch.logaddexp(term1, term2) + log_2pi  # [B, K]
+        nll = -torch.logaddexp(term1, term2) + log_norm  # [B, K]
 
         return nll
 
@@ -149,6 +156,18 @@ class Cov:
         Scalar log-volume uncertainty (analogous to SEA-RAFT / WAFT get_heatmap)
         """
         return self.alpha_1 * (self.s1 + self.s2)
+
+    @property
+    def variance(self) -> torch.Tensor:
+        """
+        Returns the geometric mean of the principal variances (sqrt(det(Cov))) under the mixture model.
+        """
+        scale_x, scale_y = self.xy_scale_total
+        alpha_1 = self.alpha_1
+        alpha_2 = 1.0 - alpha_1
+        var_1 = alpha_1 * torch.exp(2.0 * self.s1) + alpha_2
+        var_2 = alpha_1 * torch.exp(2.0 * self.s2) + alpha_2
+        return 3.0 * (scale_x * scale_y) * torch.sqrt(var_1 * var_2)
 
     def scale(self, scale_x: float, scale_y: float | None = None) -> "Cov":
         """
@@ -200,6 +219,14 @@ class Cov:
     def detach(self) -> "Cov":
         return Cov(
             params=self.params.detach(),
+            xy_scale=self.xy_scale,
+            norm_eps=self.norm_eps,
+            eps=self.eps,
+        )
+
+    def to(self, device: torch.device | str) -> "Cov":
+        return Cov(
+            params=self.params.to(device),
             xy_scale=self.xy_scale,
             norm_eps=self.norm_eps,
             eps=self.eps,
@@ -270,7 +297,7 @@ class Cov:
         sigma1_yy = b1_sq * sin_t_sq + b2_sq * cos_t_sq
 
         # Effective scale matrix: Sigma_eff = B @ (alpha_1 * Sigma_1 + alpha_2 * I_2) @ B^T
-        scale_x, scale_y = self.xy_scale
+        scale_x, scale_y = self.xy_scale_total
         sigma_eff_xx = (alpha_1 * sigma1_xx + alpha_2) * (scale_x * scale_x)
         sigma_eff_xy = (alpha_1 * sigma1_xy) * (scale_x * scale_y)
         sigma_eff_yy = (alpha_1 * sigma1_yy + alpha_2) * (scale_y * scale_y)

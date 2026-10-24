@@ -96,7 +96,7 @@ class DataLoaders(DataLoadersBase):
             prefetch_factor=2,
         )
         self.ibug = DataLoader(
-            datasets.ibug, batch_size=ibug_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=3,
+            datasets.ibug, batch_size=ibug_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=4,
             prefetch_factor=2,
         )
 
@@ -203,7 +203,7 @@ class TrainParams:
     sparsity_loss_enabled: bool = False  # TODO: validate this
     model_steps: int = 50
     query_steps: int = 32
-    freeze_backbone_steps: int = 400
+    freeze_backbone_steps: int = 300
 
     face_mesh: Path | None = None
     freeze_queries: list[str] = field(default_factory=list)
@@ -1140,9 +1140,9 @@ def validate_jitter(
 
 def compile_model(model: QLOT):
     print("Compiling model...")
-    model.feature_extractor.backbone.compile()
+    model.feature_extractor.compile()
+    model.sampler.compile(dynamic=True)
     model.mixer.compile(dynamic=True)
-    model.context_mlp.compile()
     model.gru.compile()
 
 
@@ -1189,7 +1189,7 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                 print(f"Unfreezing backbone at global step {params.global_step}.")
                 is_backbone_frozen = False
                 model.freeze_backbone(False, all=True)
-                compile_model(model)
+                # compile_model(model)
 
             is_viz = params.global_step % params.log_images_every == 0
             is_log = params.global_step % params.log_every == 0
@@ -1245,11 +1245,11 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                         nme_v = (errors.mean(dim=-1) / norm_factor).mean()
                         nme_list.append(nme_v)
 
-                        stddev = pred_pixel.cov.scalar_uncertainty.exp()
-                        cov_max.append(stddev.max())
-                        cov_min.append(stddev.min())
-                        cov_mean.append(stddev.mean())
-                        cov_std.append(stddev.std())
+                        var = pred_pixel.cov.variance
+                        cov_max.append(var.max())
+                        cov_min.append(var.min())
+                        cov_mean.append(var.mean())
+                        cov_std.append(var.std())
 
                         alpha = pred_pixel.cov.alpha_1
                         alpha_max.append(alpha.max())
@@ -1409,7 +1409,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-iterations", type=int, default=3, help="Number of model iterations per forward pass")
     parser.add_argument("--small-validate-every", type=int, default=50, help="Frequency of small validation runs (in steps)")
     parser.add_argument("--log-images-every", type=int, default=20, help="Frequency of logging images to TensorBoard (in steps)")
-    parser.add_argument("--save-latest-every", type=int, default=200, help="Frequency of saving latest checkpoint (in steps)")
+    parser.add_argument("--save-latest-every", type=int, default=100, help="Frequency of saving latest checkpoint (in steps)")
     parser.add_argument("--name", type=str, default="qlot-v2", help="Name of model experiment")
     parser.add_argument("--run", type=str, default="r0", help="Run identifier for the experiment")
     parser.add_argument("--learning-rate", type=float, default=None, help="Learning rate for optimizer")

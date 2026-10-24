@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import onnxruntime as ort
 from .utils import LandmarkPrediction, NUM_PREDS_PARAMS
-from .cov import LowRankCov2D
+from .cov import Cov
 
 
 class _CudaGraphState:
@@ -156,11 +156,33 @@ class OnnxQLOT:
         self._supports_query_points = "query_points" in self._input_names
         # Number of queries baked into the graph, if statically known.
         self._fixed_num_queries = None if self._supports_query_points else self._infer_fixed_num_queries(meta_session)
+
+        # Try loading init_hidden_state from graph initializers if present
+        self.init_hidden_state: np.ndarray | None = None
+        try:
+            import onnx
+            from onnx import numpy_helper
+            onnx_model = onnx.load(self.model_path, load_external_data=False)
+            for init in onnx_model.graph.initializer:
+                if init.name == "init_hidden_state":
+                    self.init_hidden_state = numpy_helper.to_array(init).astype(np.float32)
+                    break
+        except Exception:
+            pass
+
+        # Determine gru_hidden_dim from initial state or session inputs if available
+        self.gru_hidden_dim = 128
+        if self.init_hidden_state is not None:
+            self.gru_hidden_dim = self.init_hidden_state.shape[-1]
+        else:
+            for inp in meta_session.get_inputs():
+                if inp.name in ("hidden_state", "prefill_hidden_state") and len(inp.shape) >= 3 and isinstance(inp.shape[-1], int):
+                    self.gru_hidden_dim = inp.shape[-1]
+                    break
+
         if meta_session is not self.session:
             del meta_session
 
-        # Hardcoded based on model architecture
-        self.gru_hidden_dim = 128 
         # ONNX export is hardcoded to static batch size of 1,
         # note that the batch size cannot be easily made dynamic
         # due to ONNX Conv2D limitations.
@@ -205,76 +227,45 @@ class OnnxQLOT:
         self,
         image: torch.Tensor,
         query_points: torch.Tensor,
-        gating_radius: float | torch.Tensor = 1.0,
-        gating_cutoff: float | torch.Tensor = 0.05,
+        hidden_state: torch.Tensor | None = None,
+        predictions: LandmarkPrediction | torch.Tensor | None = None,
         iterations: int = 1, # Ignored (baked into exported model, usually 1)
         return_sequence: bool = False, # Ignored (exported model returns only final)
-        store_similarity_maps: bool = False, # Ignored
-        prefill_hidden_state: torch.Tensor | None = None,
-        prefill_starting_landmarks: LandmarkPrediction | None = None,
         return_hidden_state: bool = False,
         return_tensor_predictions: bool = False,
         detach_updates: bool = True, # Ignored
-        force_cov_gating=True, # Ignored (exported model always uses cov gating)
-        use_naive_correlation=True, # Ignored (exported model always uses naive correlation)
-        landmarks_to_mask: torch.Tensor | None = None, # Ignored (not supported in exported model
+        landmarks_to_mask: torch.Tensor | None = None, # Ignored
+        **kwargs,
     ):
         """
         Forward pass using ONNX Runtime.
         
         Note: Many arguments are ignored because they are static in the exported ONNX graph 
-        (e.g. iterations, return_sequence, gating_radius etc).
+        (e.g. iterations, return_sequence, etc).
         
         Args:
-            image: (1, 3, 224, 224) input RGB image tensor.
+            image: (1, 3, H, W) input RGB image tensor.
             query_points: (1, num_queries, 3) tensor of query points with (x, y, z) coordinates.
                 Ignored if the loaded model was exported with fixed query points baked
                 into the graph (i.e. it has no "query_points" input); the number of
                 predicted landmarks is then determined by the model, not this argument.
-            gating_radius: scalar  (model also allows per landmark radius, but scalar is
-                baked into exported ONNX model currently) for gating radius. A distance in pixels
-                where if the predicted standard deviation (sigma projected onto the
-                landmark move direction) falls below this radius, it will start to dampen
-                landmark position changes.
-            gating_cutoff: scalar (model also allows per landmark cutoff, but scalar is
-                baked into exported ONNX model currently) for gating cutoff. A value
-                between 0 and 1, where if the predicted gating value (based on the
-                predicted sigma and gating_radius, the weight in [0, 1]) is less than this
-                cutoff, the landmark will stop moving completely.
+            hidden_state: Either None, in which case it will be initialized using
+                the model's learned initial hidden state (or zeros if unavailable),
+                or a (1, num_queries, self.gru_hidden_dim) tensor from the previous frame.
+            predictions: Either None, in which case it will be initialized with the query
+                points (x, -y) and zero covariance/delta in normalized coordinates,
+                or a LandmarkPrediction / tensor containing normalized predictions from
+                the previous frame.
             iterations: Number of iterations to run on the same image. Ignored for ONNX
-                model (always 1).
+                model (usually 1).
             return_sequence: Whether to return the predictions of all iterations.
                 Ignored for ONNX model (always returns final prediction).
-            store_similarity_maps: Whether to store similarity maps.
-                Not possible with ONNX model (baked into graph).
-            prefill_hidden_state: Either None, in which case it will be initialized to
-                zeros, or a (1, num_queries, self.gru_hidden_dim) tensor, the hidden state from the
-                previous frame.
-            prefill_starting_landmarks: Either None, in which case it will be initialized
-                to zeros (in normalized coordinates this is the image center and sigma_x =
-                sigma_y = 1), or a LandmarkPrediction object containing the predictions
-                from the previous frame (or initial guess).
-                Note that the model expects landmarks in pixel coordinates relative to the
-                input image as inputs (normalization/unnormalization is handled within the
-                model), this also applies to the covariance parameters.
             return_hidden_state: Whether to return the hidden state for the next frame.
-                (Note that the ONNX model always returns the hidden state).
             return_tensor_predictions: Whether to return raw tensor predictions instead of
                 LandmarkPrediction objects. If True, returns a
                 (1, num_queries, NUM_PREDS_PARAMS) tensor.
-                (Note that the ONNX model always returns tensor predictions, so this just controls
-                whether this wrapper converts them to LandmarkPrediction or not).
-            detach_updates: Whether to detach the predicted landmarks of the previous
-                iteration from the computation graph. Ignored for ONNX model (only
-                relevant for training, baked in as always True).
-            force_cov_gating: Whether to force the use of covariance-based gating even
-                if gating_radius is set to 0 (which normally disables it).
-                Forced to True for ONNX model since the graph is exported with cov gating
-                always on. Note that therefore setting gating_radius=0 potentially causes NaNs!
-            use_naive_correlation: Whether to do the native full correlation for all
-                feature maps (even though only a small subset of them are used for
-                grid-sampling). Always True for the ONNX model since the optimized fused
-                correlation+grid-sampling kernel is implemented in Triton and so cannot be exported.
+            detach_updates: Ignored for ONNX model.
+            landmarks_to_mask: Ignored for ONNX model.
         """
         device = image.device
         batch_size, _, image_height, image_width = image.shape
@@ -293,10 +284,8 @@ class OnnxQLOT:
         onnx_inputs = self._build_onnx_inputs(
             image=image,
             query_points=query_points,
-            gating_radius=gating_radius,
-            gating_cutoff=gating_cutoff,
-            prefill_hidden_state=prefill_hidden_state,
-            prefill_starting_landmarks=prefill_starting_landmarks,
+            hidden_state=hidden_state,
+            predictions=predictions,
             batch_size=batch_size,
             num_queries=num_queries,
             image_height=image_height,
@@ -321,27 +310,20 @@ class OnnxQLOT:
             pred_np, hidden_np = self.session.run(["predictions", "hidden_state"], onnx_inputs)
         
         # --- 3. Process Outputs ---
-        
-        # Convert back to torch
-        # The model will always return predictions in pixel coordinates (relative to the
-        # input image size).
-        # Shape: (self.batch_size, num_queries, NUM_PREDS_PARAMS), same format as
-        # prefill_starting_landmarks input.
         pred_tensor = torch.from_numpy(pred_np).to(device)
-        # Shape: (self.batch_size, num_queries, self.gru_hidden_dim), new hidden state for the next frame.
         hidden_tensor = torch.from_numpy(hidden_np).to(device)
+
+        cov_xy_scale = (2.0 / image_width, 2.0 / image_height)
         
         outputs = []
-        
-        # Prepare prediction output
         if return_tensor_predictions:
             final_pred = pred_tensor
         else:
-            final_pred = LandmarkPrediction.from_tensor(pred_tensor, cov_type=LowRankCov2D)
+            final_pred = LandmarkPrediction.from_tensor(pred_tensor, cov_type=Cov)
+            final_pred.cov.xy_scale = cov_xy_scale
         
         outputs.append(final_pred)
         
-        # Handle return_hidden_state
         if return_hidden_state:
             outputs.append(hidden_tensor)
             
@@ -353,10 +335,8 @@ class OnnxQLOT:
         self,
         image: torch.Tensor,
         query_points: torch.Tensor,
-        gating_radius: float | torch.Tensor,
-        gating_cutoff: float | torch.Tensor,
-        prefill_hidden_state: torch.Tensor | None,
-        prefill_starting_landmarks: LandmarkPrediction | None,
+        hidden_state: torch.Tensor | None,
+        predictions: LandmarkPrediction | torch.Tensor | None,
         batch_size: int,
         num_queries: int,
         image_height: int,
@@ -364,73 +344,52 @@ class OnnxQLOT:
     ) -> dict[str, np.ndarray]:
         """Builds the numpy input dict expected by the exported ONNX graph."""
         # Image: (self.batch_size, 3, H, W)
-        image_np = image.detach().cpu().numpy()
+        image_np = np.ascontiguousarray(image.detach().cpu().numpy())
 
         # Query Points: (self.batch_size, num_queries, 3). Skipped for models
         # exported with fixed (baked-in) query points.
-        query_points_np = query_points.detach().cpu().numpy() if self._supports_query_points else None
+        query_points_np = np.ascontiguousarray(query_points.detach().cpu().numpy()) if self._supports_query_points else None
 
-        # Gating Cutoff: (1,)
-        if isinstance(gating_cutoff, (float, int)):
-            gating_cutoff_np = np.array([gating_cutoff], dtype=np.float32)
+        # Hidden State: (self.batch_size, num_queries, Hidden)
+        if hidden_state is None:
+            if self.init_hidden_state is not None:
+                init_h = self.init_hidden_state.reshape(1, 1, -1)
+                hidden_state_np = np.repeat(np.repeat(init_h, batch_size, axis=0), num_queries, axis=1)
+            else:
+                hidden_state_np = np.zeros(
+                    (batch_size, num_queries, self.gru_hidden_dim),
+                    dtype=np.float32
+                )
         else:
-            gating_cutoff_np = gating_cutoff.detach().cpu().numpy()
-            if gating_cutoff_np.ndim == 0:
-                gating_cutoff_np = gating_cutoff_np[None]
+            hidden_state_np = hidden_state.detach().cpu().to(torch.float32).numpy()
+        hidden_state_np = np.ascontiguousarray(hidden_state_np, dtype=np.float32)
 
-        # Gating Radius: (1,)
-        if isinstance(gating_radius, (float, int)):
-            gating_radius_np = np.array([gating_radius], dtype=np.float32)
+        # Predictions: (self.batch_size, num_queries, NUM_PREDS_PARAMS)
+        if predictions is None:
+            predictions_np = np.zeros((batch_size, num_queries, NUM_PREDS_PARAMS), dtype=np.float32)
+            if query_points is not None:
+                qp = query_points.detach().cpu().numpy()
+                predictions_np[..., 0] = qp[..., 0]
+                predictions_np[..., 1] = -qp[..., 1]
+        elif isinstance(predictions, LandmarkPrediction):
+            predictions_np = predictions.to_tensor().detach().cpu().to(torch.float32).numpy()
+        elif isinstance(predictions, torch.Tensor):
+            predictions_np = predictions.detach().cpu().to(torch.float32).numpy()
         else:
-            gating_radius_np = gating_radius.detach().cpu().numpy()
-            if gating_radius_np.ndim == 0:
-                gating_radius_np = gating_radius_np[None]
+            predictions_np = np.asarray(predictions, dtype=np.float32)
+        predictions_np = np.ascontiguousarray(predictions_np, dtype=np.float32)
 
-        # Prefill Hidden State: (self.batch_size, num_queries, Hidden)
-        if prefill_hidden_state is None:
-            prefill_hidden_state_np = np.zeros(
-                (batch_size, num_queries, self.gru_hidden_dim),
-                dtype=np.float32
-            )
-        else:
-            prefill_hidden_state_np = prefill_hidden_state.detach().cpu().numpy()
-
-        # Prefill Starting Landmarks: (self.batch_size, num_queries, NUM_PREDS_PARAMS)
-        # where the last dimension is (x, y, log sigma_x, log sigma_y, rho_raw, dx, dy).
-        #
-        # rho = tanh(rho_raw) is the correlation coefficient in [-1, 1].
-        # x, y, dx and dy are in pixel coordinates relative to the input image size.
-        # The model uses a normalized [-1, 1] coordinate system and manages coordinate
-        # conversion internally.
-        if prefill_starting_landmarks is None:
-            # If original model receives None, it inits to zeros (Normalized).
-            # To achieve zeros (Normalized) via the normalize_coords path,
-            # we must pass the unnormalized version of zeros.
-            # Normalized zeros: x=0, y=0 (image center), sigma_x=1, sigma_y=1,
-            # rho=0, dx=0, dy=0.
-
-            # create normalized zeros
-            norm_zeros = torch.zeros(
-                batch_size, num_queries, NUM_PREDS_PARAMS,
-                dtype=image.dtype, device=image.device
-            )
-            norm_pred = LandmarkPrediction.from_tensor(norm_zeros, cov_type=LowRankCov2D)
-
-            # Unnormalize to get pixel coords tensor
-            pixel_pred = norm_pred.unnormalize_coords(image_width, image_height)
-            prefill_starting_landmarks_np = pixel_pred.to_tensor().detach().cpu().numpy()
-        else:
-            # Assumed to be in Pixel coordinates already
-            prefill_starting_landmarks_np = prefill_starting_landmarks.to_tensor().detach().cpu().numpy()
-
+        h_name = "prefill_hidden_state" if "prefill_hidden_state" in self._input_names else ("hidden_state" if "hidden_state" in self._input_names else "prefill_hidden_state")
+        p_name = "prefill_starting_landmarks" if "prefill_starting_landmarks" in self._input_names else ("predictions" if "predictions" in self._input_names else "prefill_starting_landmarks")
         inputs = {
             "image": image_np,
-            "gating_cutoff": gating_cutoff_np,
-            "gating_radius": gating_radius_np,
-            "prefill_hidden_state": prefill_hidden_state_np,
-            "prefill_starting_landmarks": prefill_starting_landmarks_np,
+            h_name: hidden_state_np,
+            p_name: predictions_np,
         }
-        # Models exported with fixed query points reject a "query_points" input.
+        if "gating_cutoff" in self._input_names:
+            inputs["gating_cutoff"] = np.array([0.05], dtype=np.float32)
+        if "gating_radius" in self._input_names:
+            inputs["gating_radius"] = np.array([1.0], dtype=np.float32)
         if self._supports_query_points:
             assert query_points_np is not None
             inputs["query_points"] = query_points_np
