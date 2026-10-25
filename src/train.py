@@ -462,7 +462,7 @@ class ProcessBatch:
                 spatial_hconsistency = (pred_orig - unflipped_mean).square().sum(dim=-1)  # (its, batch/2, queries)
 
                 # 2. Covariance Consistency
-                cov_params = preds_pixel.cov.params.clone()  # (iters, batch_size, queries, 5)
+                cov_params = preds_pixel.cov.params.clone()  # (iters, batch_size, queries, 4)
                 cov_orig = cov_params[:, 0::2].clone()
                 cov_flip = cov_params[:, 1::2].clone()
 
@@ -470,7 +470,7 @@ class ProcessBatch:
                 unflipped_cov = cov_flip[:, :, flip_indices, :].clone()
                 unflipped_cov[..., 3] = -unflipped_cov[..., 3]
 
-                cov_hconsistency = (cov_orig - unflipped_cov).abs().sum(dim=-1)  # L1 on s1, s2, u_x, u_y, w
+                cov_hconsistency = (cov_orig - unflipped_cov).abs().sum(dim=-1)  # L1 on s1, s2, u_x, u_y
 
                 hconsistency_loss = spatial_hconsistency + 0.1 * cov_hconsistency
 
@@ -1229,7 +1229,6 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
 
                 nme_list = []
                 cov_max, cov_min, cov_mean, cov_std = [], [], [], []
-                alpha_max, alpha_min, alpha_mean, alpha_std = [], [], [], []
                 with torch.no_grad():
                     # Calculate normalized mean error (NME) over the last batch
                     for pred_pixel, pred_labels in zip(pred_list, labels_list):
@@ -1251,12 +1250,6 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                         cov_mean.append(var.mean())
                         cov_std.append(var.std())
 
-                        alpha = pred_pixel.cov.alpha_1
-                        alpha_max.append(alpha.max())
-                        alpha_min.append(alpha.min())
-                        alpha_mean.append(alpha.mean())
-                        alpha_std.append(alpha.std())
-
                     tb_writer.add_scalar("NME/train", torch.stack(nme_list).mean(), params.global_step)
 
                     # Log variance statistics
@@ -1264,11 +1257,6 @@ def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):
                     tb_writer.add_scalar("Variance/std", torch.stack(cov_std).mean().item(), params.global_step)
                     tb_writer.add_scalar("Variance/min", torch.stack(cov_min).mean().item(), params.global_step)
                     tb_writer.add_scalar("Variance/max", torch.stack(cov_max).mean().item(), params.global_step)
-
-                    tb_writer.add_scalar("Alpha/mean", torch.stack(alpha_mean).mean().item(), params.global_step)
-                    tb_writer.add_scalar("Alpha/std", torch.stack(alpha_std).mean().item(), params.global_step)
-                    tb_writer.add_scalar("Alpha/min", torch.stack(alpha_min).mean().item(), params.global_step)
-                    tb_writer.add_scalar("Alpha/max", torch.stack(alpha_max).mean().item(), params.global_step)
 
                 # Log learning rate
                 current_lr = optimizer.param_groups[0]["lr"]
@@ -1490,6 +1478,7 @@ if __name__ == "__main__":
             "query_encoder.*": ParamCfg(lr=lr, weight_decay=0.0),
             "mixer.wr_temperature": ParamCfg(weight_decay=0.0),
             "mixer.residual_weights": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
+            "context_w": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
         },
         other_params=[
             # (query_points.parameters(), ParamCfg(lr=args.queries_lr, weight_decay=0.0))

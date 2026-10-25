@@ -48,10 +48,10 @@ class QLOT(nn.Module):
         self.query_pre_enc_dim = self.query_encoder.out_dims
         self.query_enc_dim = 256 - self.context_dim
         self.query_enc_mlp = nn.Sequential(
-            nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, 256), nn.RMSNorm(256)
+            nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, 256)
         )
         init(self.query_enc_mlp[0], nonlinearity="relu")
-        init(self.query_enc_mlp[2], nonlinearity="relu")
+        init(self.query_enc_mlp[2], nonlinearity="linear")
 
         # Flip y and z axes to match image coordinates
         self.register_buffer("queries_transform", torch.tensor([1.0, -1.0, -1.0], dtype=torch.float32), persistent=False)
@@ -65,17 +65,18 @@ class QLOT(nn.Module):
         # Global features
         self.global_feat_proj = nn.Sequential(
             nn.Linear(self.feature_extractor.global_channels, self.context_dim),
-            nn.RMSNorm(self.context_dim),
         )
         init(self.global_feat_proj[0], nonlinearity="linear")
 
         # Last predictions encoding
         kin_dim = 64
         self.kin_encoder = nn.Sequential(
-            nn.Linear(NUM_PREDS_PARAMS, kin_dim), nn.RMSNorm(kin_dim), nn.SiLU(), nn.Linear(kin_dim, self.context_dim)
+            nn.Linear(NUM_PREDS_PARAMS, kin_dim), nn.SiLU(), nn.Linear(kin_dim, self.context_dim)
         )
         init(self.kin_encoder[0], nonlinearity="relu")
-        init(self.kin_encoder[3], nonlinearity="linear")
+        init(self.kin_encoder[2], nonlinearity="linear")
+
+        self.context_w = nn.Parameter(torch.tensor([0.1, 0.025]))
 
         # Local patch sampling
         self.sampler = LocalPatchSampler(
@@ -88,7 +89,6 @@ class QLOT(nn.Module):
             nn.SiLU(),
         )
         init(self.vision_feat_mlp[0], nonlinearity="relu")
-        self.context_norm = nn.RMSNorm(self.context_dim, elementwise_affine=False)
 
         self.mixer = LowRankWriteReadMixer(
             read_dim=self.query_enc_dim + self.hidden_dim,
@@ -253,7 +253,7 @@ class QLOT(nn.Module):
 
         context_feat = self.global_feat_proj(context_feat)
         context_feat = context_feat.unsqueeze(1).expand(batch_size, num_queries, -1)  # (batch_size, num_queries, context_dim)
-        context_feat = context_feat + query_enc_ctx  # Fuse with query encoding
+        context_feat = query_enc_ctx + self.context_w[0] * context_feat  # Fuse with query encoding
 
         last_hidden = hidden_state
         last_coords = predictions.mean
@@ -268,7 +268,7 @@ class QLOT(nn.Module):
 
             # Process context features
             kin_enc = self.kin_encoder(torch.cat([last_coords, Cov(last_cov).as_bounded_params(), last_delta * 10.0], dim=-1))
-            curr_context = self.context_norm(context_feat + kin_enc)
+            curr_context = context_feat + self.context_w[1] * kin_enc
 
             # Lookup local features at each coord
             warped_features = self.sampler(
@@ -332,13 +332,13 @@ class QLOT(nn.Module):
                 torch.stack([p[0] for p in preds_out], dim=0),  # Shape: (batch_size, iterations, num_queries, 2)
                 Cov(
                     torch.stack([p[1] for p in preds_out], dim=0), xy_scale=cov_xy_scale
-                ),  # Shape: (batch_size, iterations, num_queries, 5)
+                ),  # Shape: (batch_size, iterations, num_queries, 4)
                 torch.stack([p[2] for p in preds_out], dim=0),  # Shape: (batch_size, iterations, num_queries, 2)
             )
         else:
             preds_out2 = (
                 preds_out[0][0],  # Shape: (batch_size, num_queries, 2)
-                Cov(preds_out[0][1], xy_scale=cov_xy_scale),  # Shape: (batch_size, num_queries, 5)
+                Cov(preds_out[0][1], xy_scale=cov_xy_scale),  # Shape: (batch_size, num_queries, 4)
                 preds_out[0][2],  # Shape: (batch_size, num_queries, 2)
             )
         preds = LandmarkPrediction(*preds_out2)

@@ -232,22 +232,19 @@ class PyTorchProfiler:
                 "model.feature_extractor.down_proj",
                 "model.feature_extractor.fusion_conv",
                 "model.feature_extractor.global_pool",
+                "model.global_feat_proj"
             ],
             "Query Encoding": [
                 "model.query_encoder",
                 "model.query_enc_mlp",
-                "model.global_feat_proj",
             ],
             "Local Sampling": ["model.sampler"],
             "Context Encoding": [
                 "model.kin_encoder",
-                "model.vis_summary_proj",
-                "model.context_mlp",
-                "model.context_norm",
-                "model.vision_feat_mlp",
                 "model.hidden_norm",
             ],
             "Update Predictor": [
+                "model.vision_feat_mlp",
                 "model.mixer",
                 "model.gate_proj",
                 "model.gru",

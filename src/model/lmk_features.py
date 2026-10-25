@@ -17,8 +17,8 @@ class LocalPatchSampler(nn.Module):
         self.map_channels = list(map_channels)
         self.sample_res = sample_res
         self.attn_heads = attn_heads
-        self.head_dims = [c // attn_heads for c in self.map_channels]
-        self.attn_scales = [1.0 / math.sqrt(hd) for hd in self.head_dims]
+        self.head_ch_dims = [c // attn_heads for c in self.map_channels]
+        self.attn_scales = [1.0 / math.sqrt(hd) for hd in self.head_ch_dims]
 
         t = torch.linspace(-1.0, 1.0, steps=sample_res, dtype=torch.float32) * (sample_res - 1.0)
         ys, xs = torch.meshgrid(t, t, indexing="ij")
@@ -32,13 +32,12 @@ class LocalPatchSampler(nn.Module):
 
         chan_mult = 2
         kernel_size = 4
-        self.corr_conv = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(attn_heads, chan_mult * attn_heads, kernel_size=kernel_size, padding=0),
-                nn.SiLU()
-            )
-            for _ in range(len(map_channels))
-        ])
+        self.corr_conv = nn.ModuleList(
+            [
+                nn.Sequential(nn.Conv2d(attn_heads, chan_mult * attn_heads, kernel_size=kernel_size, padding=0), nn.SiLU())
+                for _ in range(len(map_channels))
+            ]
+        )
         for c in self.corr_conv:
             assert isinstance(c, nn.Sequential)
             init(c[0], nonlinearity="relu")
@@ -70,27 +69,27 @@ class LocalPatchSampler(nn.Module):
 
         out_samples = []
         for i, sample in enumerate(samples):
-            head_dim = self.head_dims[i]
+            head_ch_dim = self.head_ch_dims[i]
             scale = self.attn_scales[i]
 
             kernel: torch.Tensor = self.ctx_proj[i](context)  # (batch_size, num_queries, C_i)
-            kernel = kernel.view(batch_size, num_queries, self.attn_heads, 1, head_dim)
+            kernel = kernel.view(batch_size, num_queries, self.attn_heads, 1, head_ch_dim)
 
-            sample = sample.view(batch_size, num_queries, self.attn_heads, head_dim, res_sq)
+            sample = sample.view(batch_size, num_queries, self.attn_heads, head_ch_dim, res_sq)
 
-            corr: torch.Tensor = torch.matmul(kernel, sample)  # (batch_size, num_queries, H, 1, res_sq)
+            corr: torch.Tensor = kernel @ sample  # (batch_size, num_queries, H, 1, res_sq)
             corr = corr.squeeze(-2) * scale  # (batch_size, num_queries, H, res_sq)
 
             probs = corr.softmax(dim=-1)  # (batch_size, num_queries, H, res_sq)
             feat = sample @ probs[..., None]  # (batch_size, num_queries, H, C_i//H, 1)
+            feat = feat.flatten(-3)  # (batch_size, num_queries, C_i)
+            feat = F.rms_norm(feat, (self.map_channels[i],))
 
             corr = corr.view(batch_size * num_queries, self.attn_heads, res, res)
             corr = self.corr_conv[i](corr)  # (batch_size * num_queries, 8, res_h', res_w')
             corr = corr.view(batch_size, num_queries, self.out_corr_dims)
 
-            out_samples.append(
-                (feat.view(batch_size, num_queries, self.map_channels[i]), corr)
-            )
+            out_samples.append((feat, corr))
 
         return out_samples
 

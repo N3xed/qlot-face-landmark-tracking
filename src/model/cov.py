@@ -1,40 +1,30 @@
 import torch
 import math
 from dataclasses import dataclass
-from torch import nn
-import torch.nn.functional as F
 from typing import ClassVar, Literal
 
-NUM_PREDS_COV_PARAMS = 5
+NUM_PREDS_COV_PARAMS = 4
 
 
 @dataclass
 class Cov:
     """
-    A covariance represented as a 2-component 2D Anisotropic Radial Laplace Mixture (MoL) distribution.
+    A covariance represented as a 2D Anisotropic Radial Laplace distribution.
 
-    Similar to SEA-RAFT and WAFT, the coordinate error e = p* - p is modeled as a mixture of
-    two 2D Radial Laplace components defined relative to a 2D base (inlier) scale matrix
-    B = diag(scale_x, scale_y):
+    The coordinate error e = p* - p is modeled as a 2D Radial Laplace density
+    defined relative to a 2D base (inlier) scale matrix B = diag(scale_x, scale_y):
 
-       p(e) =   alpha_1 * 1/(2 * pi * sqrt(det(Sigma_1))) * exp(-sqrt(e^T Sigma_1^-1 e))
-              + alpha_2 * 1/(2 * pi * sqrt(det(Sigma_2))) * exp(-sqrt(e^T Sigma_2^-1 e))
+       p(e) = 1 / (2 * pi * sqrt(det(Sigma))) * exp(-sqrt(e^T Sigma^-1 e))
 
     where:
-       Sigma_2 = B @ I_2 @ B^T = diag(scale_x^2, scale_y^2)
-       Sigma_1 = B @ R(theta) @ diag(b_1^2, b_2^2) @ R(theta)^T @ B^T
+       Sigma = B @ R(theta) @ diag(b_1^2, b_2^2) @ R(theta)^T @ B^T
 
     In the base-scale-whitened frame e_tilde = B^-1 e = (e_x / scale_x, e_y / scale_y),
-    the inlier branch has unit scale I_2 and the outlier branch has scale matrix
-    R(theta) @ diag(b_1^2, b_2^2) @ R(theta)^T >= I_2.
+    the scale matrix is R(theta) @ diag(b_1^2, b_2^2) @ R(theta)^T >= I_2.
 
-    alpha_1 and alpha_2 are the mixture weights, with alpha_1 weighing the outlier branch
-    and alpha_2 weighing the inlier branch, parameterized by a single logit w:
-
-       alpha_1 = sigmoid(w), alpha_2 = 1 - alpha_1
-
-    So that the outlier eigenvalues b_i^2 are at least 1 relative to the inlier scale, we
-    parameterize:
+    So that the eigenvalues b_i^2 are at least 1 relative to the base (inlier) scale
+    (preventing variance collapse and recovering pure unit-scale L2 loss at s_1 = s_2 = 0),
+    we parameterize:
 
        b_i = exp(s_i), where s_i are clamped to [0, s_max].
 
@@ -46,18 +36,17 @@ class Cov:
        sin theta = u_y' / sqrt(u_x'^2 + u_y'^2 + norm_eps)
 
     Attributes:
-        params: Tensor of shape (..., 5) containing:
-            - s_1, s_2: Log semi-axes of the outlier ellipse relative to `xy_scale_total`.
+        params: Tensor of shape (..., 4) containing:
+            - s_1, s_2: Log semi-axes of the uncertainty ellipse relative to `xy_scale_total`.
             - u_x, u_y: Unnormalized direction vector offset from (1, 0) to compute theta.
-            - w: Logit of the mixture weight alpha_1 for the outlier branch.
         xy_scale: Coordinate-frame scale `(scale_x, scale_y)` along the x- and y-axes
             (e.g., `(1.0, 1.0)` in pixel space or `(2 / W, 2 / H)` in `[-1, 1]` normalized space).
             Combined with the class constant `base_scale` to form `xy_scale_total`.
     """
 
-    base_scale: ClassVar[float] = 0.5
+    base_scale: ClassVar[float] = 0.25
 
-    params: torch.Tensor  # Shape (..., 5) containing s_1, s_2, u_x, u_y, w
+    params: torch.Tensor  # Shape (..., 4) containing s_1, s_2, u_x, u_y
     xy_scale: tuple[float, float] = (1.0, 1.0)
 
     norm_eps: float = 1e-6
@@ -90,21 +79,13 @@ class Cov:
     def uy(self) -> torch.Tensor:
         return self.params[..., 3]
 
-    @property
-    def w(self) -> torch.Tensor:
-        return self.params[..., 4]
-
-    @property
-    def alpha_1(self) -> torch.Tensor:
-        return torch.sigmoid(self.w)
-
     def nll_loss(
         self,
         pred_xy: torch.Tensor,
         gt_xy: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute the negative log-likelihood of the predicted landmarks under the mixture model.
+        Compute the negative log-likelihood of the predicted landmarks under the Radial Laplace model.
 
         Args:
             pred_xy: Predicted landmark coordinates of shape [B, K, 2].
@@ -117,10 +98,7 @@ class Cov:
         ex = e[..., 0] / scale_x
         ey = e[..., 1] / scale_y
 
-        # Component 2 (Inlier): Fixed Sigma_2 = I_2 -> pure L2
-        d2 = torch.sqrt(ex.square() + ey.square() + self.eps**2)  # [B, K]
-
-        # Component 1 (Outlier / Contour): Anisotropic 2x2 Sigma_1 >= I_2
+        # Anisotropic 2x2 Sigma >= I_2 in base-scale-whitened frame
         s1 = self.s1
         s2 = self.s2
 
@@ -135,39 +113,29 @@ class Cov:
         e_para = cos_t * ex + sin_t * ey
         e_perp = -sin_t * ex + cos_t * ey
 
-        d1 = torch.sqrt((e_para * torch.exp(-s1)).square() + (e_perp * torch.exp(-s2)).square() + self.eps**2)
-        s_det_1 = s1 + s2  # 0.5 * log(det(Sigma_1)) since det(R) == 1
+        d = torch.sqrt((e_para * torch.exp(-s1)).square() + (e_perp * torch.exp(-s2)).square() + self.eps**2)
+        s_det = s1 + s2  # 0.5 * log(det(Sigma)) since det(R) == 1
 
-        # Mixture Negative Log-Likelihood via logaddexp (including log|det(B)| = log(scale_x * scale_y) Jacobian)
+        # Negative Log-Likelihood (including log|det(B)| = log(scale_x * scale_y) Jacobian)
         log_norm = math.log(2.0 * math.pi * scale_x * scale_y)
-
-        log_alpha1 = -F.softplus(-self.w)
-        log_alpha2 = -F.softplus(self.w)
-
-        term1 = log_alpha1 - s_det_1 - d1
-        term2 = log_alpha2 - d2  # s_det_2 is zero, so omitted
-        nll = -torch.logaddexp(term1, term2) + log_norm  # [B, K]
+        nll = s_det + d + log_norm  # [B, K]
 
         return nll
 
     @property
     def scalar_uncertainty(self) -> torch.Tensor:
         """
-        Scalar log-volume uncertainty (analogous to SEA-RAFT / WAFT get_heatmap)
+        Scalar log-volume uncertainty (0.5 * log(det(Sigma)) in base-scale-whitened frame).
         """
-        return self.alpha_1 * (self.s1 + self.s2)
+        return self.s1 + self.s2
 
     @property
     def variance(self) -> torch.Tensor:
         """
-        Returns the geometric mean of the principal variances (sqrt(det(Cov))) under the mixture model.
+        Returns the geometric mean of the principal variances (sqrt(det(Cov))) under the Radial Laplace model.
         """
         scale_x, scale_y = self.xy_scale_total
-        alpha_1 = self.alpha_1
-        alpha_2 = 1.0 - alpha_1
-        var_1 = alpha_1 * torch.exp(2.0 * self.s1) + alpha_2
-        var_2 = alpha_1 * torch.exp(2.0 * self.s2) + alpha_2
-        return 3.0 * (scale_x * scale_y) * torch.sqrt(var_1 * var_2)
+        return 3.0 * (scale_x * scale_y) * torch.exp(self.s1 + self.s2)
 
     def scale(self, scale_x: float, scale_y: float | None = None) -> "Cov":
         """
@@ -238,7 +206,7 @@ class Cov:
         approximately in [-1, 1].
 
         Returns:
-            Bounded covariance parameters of shape [..., 5].
+            Bounded covariance parameters of shape [..., 4].
         """
 
         s = self.params[..., :2] * 0.25
@@ -247,17 +215,15 @@ class Cov:
         inv_norm = torch.rsqrt(ux.square() + uy.square() + self.norm_eps)
         cos_t = ux * inv_norm
         sin_t = uy * inv_norm
-        alpha = self.alpha_1
 
         return torch.cat(
             [
                 s,
                 cos_t[..., None],
                 sin_t[..., None],
-                alpha[..., None],
             ],
             dim=-1,
-        )  # [..., 5]
+        )  # [..., 4]
 
 
     def as_cov2d_params(
@@ -268,14 +234,11 @@ class Cov:
         Extracts 3 params (diagonal elements and off-diagonal element) of 2D covariance matrix in the current coordinate frame.
 
         Args:
-            mode: "cov" returns the statistical covariance matrix of the mixture,
-                  "eff" returns the effective matrix
+            mode: "cov" returns the statistical covariance matrix of the distribution,
+                  "eff" returns the effective scale matrix
         Returns:
             2x2 covariance matrix of shape [..., 3] where last dim is (sigma_xx, sigma_yy, sigma_xy).
         """
-        alpha_1 = self.alpha_1  # Outlier / anisotropic weight
-        alpha_2 = 1.0 - alpha_1  # Inlier / isotropic weight
-
         s1 = self.s1
         s2 = self.s2
 
@@ -285,7 +248,7 @@ class Cov:
         cos_t = ux * inv_norm
         sin_t = uy * inv_norm
 
-        # Construct Sigma_1 = R @ diag(b1^2, b2^2) @ R^T
+        # Construct Sigma_tilde = R @ diag(b1^2, b2^2) @ R^T
         b1_sq = torch.exp(2.0 * s1)
         b2_sq = torch.exp(2.0 * s2)
         cos_t_sq = cos_t.square()
@@ -296,11 +259,11 @@ class Cov:
         sigma1_xy = (b1_sq - b2_sq) * cos_sin_t
         sigma1_yy = b1_sq * sin_t_sq + b2_sq * cos_t_sq
 
-        # Effective scale matrix: Sigma_eff = B @ (alpha_1 * Sigma_1 + alpha_2 * I_2) @ B^T
+        # Scale matrix: Sigma = B @ Sigma_tilde @ B^T
         scale_x, scale_y = self.xy_scale_total
-        sigma_eff_xx = (alpha_1 * sigma1_xx + alpha_2) * (scale_x * scale_x)
-        sigma_eff_xy = (alpha_1 * sigma1_xy) * (scale_x * scale_y)
-        sigma_eff_yy = (alpha_1 * sigma1_yy + alpha_2) * (scale_y * scale_y)
+        sigma_eff_xx = sigma1_xx * (scale_x * scale_x)
+        sigma_eff_xy = sigma1_xy * (scale_x * scale_y)
+        sigma_eff_yy = sigma1_yy * (scale_y * scale_y)
 
         sigma_eff = torch.stack(
             [
@@ -326,8 +289,8 @@ class Cov:
         Extracts 2x2 covariance matrix in the current coordinate frame.
 
         Args:
-            mode: "cov" returns the statistical covariance matrix of the mixture,
-                  "eff" returns the effective matrix
+            mode: "cov" returns the statistical covariance matrix of the distribution,
+                  "eff" returns the effective scale matrix
         Returns:
             2x2 covariance matrix of shape [..., 2, 2].
         """
