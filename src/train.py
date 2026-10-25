@@ -92,11 +92,21 @@ class DataLoaders(DataLoadersBase):
             stream_idx=1,
         )
         self.wflw = DataLoader(
-            datasets.wflw, batch_size=wflw_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=3,
+            datasets.wflw,
+            batch_size=wflw_bs,
+            num_workers=1,
+            persistent_workers=True,
+            generator=_seed(rng),
+            stream_idx=3,
             prefetch_factor=2,
         )
         self.ibug = DataLoader(
-            datasets.ibug, batch_size=ibug_bs, num_workers=1, persistent_workers=True, generator=_seed(rng), stream_idx=4,
+            datasets.ibug,
+            batch_size=ibug_bs,
+            num_workers=1,
+            persistent_workers=True,
+            generator=_seed(rng),
+            stream_idx=4,
             prefetch_factor=2,
         )
 
@@ -409,8 +419,20 @@ class ProcessBatch:
         curr_batch: Batch | None = None
         preds: LandmarkPrediction | None = None
 
+        batch_all = batch.as_single_batch_dim()
+        attn_mask = torch.zeros(batch_all.queries.shape[0], nqueries, device=params.device, dtype=torch.bool)
+        if nqueries in [70, 98]:
+            # Mask all pupil landmarks for WFLW/Face Synthetics landmarks.
+            attn_mask[:, -2:] = True
+
+        image_feat = model.forward_image(image=batch_all.images, query_points=batch_all.queries, landmarks_to_mask=attn_mask)
+        image_feat = image_feat.as_frames(batch.orig_clip_len)
+
+        batch_size = batch.batch_size
         for frame_i in range(batch.orig_clip_len):
+            
             curr_batch = batch[batch_idx, frame_idx]
+            curr_image_feat = image_feat[batch_idx, frame_idx]
 
             starting_predictions = predictions
             if self.rng.random() < 0.005:
@@ -426,9 +448,15 @@ class ProcessBatch:
                 prev_2_pred_mean_detached = None
                 prev_2_pred_cov_detached = None
 
-            preds, hidden_state = model(
-                curr_batch.images,
-                curr_batch.queries,
+            if hidden_state is None:
+                hidden_state = model.new_hidden_state(batch_size=batch_size, num_queries=nqueries)
+            if starting_predictions is None:
+                starting_predictions = model.new_predictions(
+                    batch_size=batch_size, num_queries=nqueries, query_points=curr_batch.queries, image_size=curr_batch.image_size
+                )
+
+            preds, hidden_state = model.forward_refine(
+                feat=curr_image_feat,
                 iterations=curr_iters,
                 return_sequence=True,
                 return_hidden_state=True,
@@ -441,7 +469,6 @@ class ProcessBatch:
 
             image_height, image_width = curr_batch.image_size
             preds_pixel = preds.unnormalize_coords(image_width, image_height)
-
 
             # --- TTA Bias Cancellation for Paired Flip Batches ---
             hconsistency_loss = torch.zeros(1, 1, 1, device=preds_pixel.mean.device)  # Default to zero if not computed
@@ -506,7 +533,7 @@ class ProcessBatch:
             acceleration_gnll_weighted = torch.zeros_like(nll_loss_weighted)
             delta_gnll_weighted = torch.zeros_like(nll_loss_weighted)
 
-            if False: #frame_i > 0 and prev_labels is not None and prev_pred_mean_detached is not None:
+            if False:  # frame_i > 0 and prev_labels is not None and prev_pred_mean_detached is not None:
                 assert prev_pred_cov_detached is not None
                 assert isinstance(preds.cov, LowRankCov2D)
 
@@ -889,7 +916,7 @@ def validate(
                 i, batch = batch
 
                 test_batch = QueriedFaceDataset.wrap(batch, device=params.device, query_points=params.query_points.queries)
-                is_show_maps = False # loader_i == show_loader_i and i == show_i
+                is_show_maps = False  # loader_i == show_loader_i and i == show_i
 
                 # Forward pass for the batch
                 res: tuple[LandmarkPrediction, list[torch.Tensor]] | LandmarkPrediction = model(
@@ -1140,10 +1167,7 @@ def validate_jitter(
 
 def compile_model(model: QLOT):
     print("Compiling model...")
-    model.feature_extractor.compile()
-    model.sampler.compile(dynamic=True)
-    model.mixer.compile(dynamic=True)
-    model.gru.compile()
+    model.compile()
 
 
 def train(cfg: Config, params: TrainParams, dataloaders: DataLoadersBase):

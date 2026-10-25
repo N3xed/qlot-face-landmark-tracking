@@ -87,6 +87,35 @@ class Batch:
         h, w = self.images.shape[-2:]
         return h, w
 
+    def as_single_batch_dim(self) -> "Batch":
+        """
+        Convert the batch to have a single batch dimension if it doesn't already.
+
+        Returns:
+            A new Batch instance with a single batch dimension.
+        """
+        if self.images.ndim == 5:
+            images = self.images.flatten(0, 1)
+            queries = self.queries.flatten(0, 1)
+            labels = self.labels.flatten(0, 1)
+            weights = self.weights.flatten(0, 1)
+        else:
+            images = self.images
+            queries = self.queries
+            labels = self.labels
+            weights = self.weights
+
+        return Batch(
+            images=images,
+            queries=queries,
+            labels=labels,
+            weights=weights,
+            dataset=self.dataset,
+            orig_clip_len=self.orig_clip_len,
+            orig_batch_size=self.orig_batch_size,
+            fps=self.fps,
+        )
+
     def normalize_landmarks(self, landmarks=None) -> torch.Tensor:
         """
         Normalize the labels to the range [-1, 1], where (-1, -1) corresponds to the top-left.
