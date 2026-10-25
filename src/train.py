@@ -62,7 +62,7 @@ class DataLoaders(DataLoadersBase):
         try:
             face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = cfg.batch_sizes
         except:
-            face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = 8, 4, 4, 4
+            face_synth_bs, wflw_bs, wflw_v_bs, ibug_bs = 16, 6, 8, 6
             print(f"Using default batch sizes for dataloaders: ({face_synth_bs}, {wflw_bs}, {wflw_v_bs}, {ibug_bs})")
 
         # Derive distinct generators per training loader so their batch-order streams are independent
@@ -1499,10 +1499,10 @@ if __name__ == "__main__":
     opt_params = utils.torch.optim.opt_param_cfg(
         model.named_parameters(),
         config={
-            "query_encoder.*": ParamCfg(lr=lr, weight_decay=0.0),
+            "query_encoder.*": ParamCfg(weight_decay=0.0),
             "mixer.wr_temperature": ParamCfg(weight_decay=0.0),
-            "mixer.residual_weights": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
-            "context_w": ParamCfg(lr=2.0 * lr, weight_decay=0.0),
+            "mixer.residual_weights": ParamCfg(weight_decay=0.0),
+            "context_fusion_weights": ParamCfg(weight_decay=0.0),
         },
         other_params=[
             # (query_points.parameters(), ParamCfg(lr=args.queries_lr, weight_decay=0.0))

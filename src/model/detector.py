@@ -73,16 +73,20 @@ class QLOT(nn.Module):
 
         self.hidden_dim = 128
         self.sample_res = 5
-        self.context_dim = 192
+        self.context_dim = 256
+        self.query_enc_dim = 64
 
         # Query points
         self.query_encoder = PhaseModulatedPE(in_dims=3, num_fourier_freq=16, num_phase_mod_freq=8, tau=0.03)
 
         self.query_pre_enc_dim = self.query_encoder.out_dims
-        self.query_enc_dim = 256 - self.context_dim
-        self.query_enc_mlp = nn.Sequential(nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, 256))
-        init(self.query_enc_mlp[0], nonlinearity="relu")
-        init(self.query_enc_mlp[2], nonlinearity="linear")
+        self.query_mlp = nn.Sequential(
+            nn.Linear(self.query_pre_enc_dim, 256), nn.SiLU(), nn.Linear(256, self.context_dim), nn.RMSNorm(self.context_dim)
+        )
+        init(self.query_mlp[0], nonlinearity="relu")
+        init(self.query_mlp[2], nonlinearity="linear")
+        self.query_proj = nn.Sequential(nn.Linear(self.query_pre_enc_dim, self.query_enc_dim), nn.SiLU())
+        init(self.query_proj[0], nonlinearity="linear")
 
         # Flip y and z axes to match image coordinates
         self.register_buffer("queries_transform", torch.tensor([1.0, -1.0, -1.0], dtype=torch.float32), persistent=False)
@@ -90,14 +94,14 @@ class QLOT(nn.Module):
         # Backbone
         self.feature_extractor = ImageFeatureExtractor(pretrained=feature_extractor_pretrained, stream_safe=False)
 
-        # Hidden state init
-        self.init_hidden_state = nn.Parameter(torch.randn(1, 1, self.hidden_dim) / math.sqrt(self.hidden_dim))
-
         # Global features
         self.global_feat_proj = nn.Sequential(
-            nn.Linear(self.feature_extractor.global_channels, self.context_dim),
+            nn.Linear(self.feature_extractor.global_channels, self.context_dim), nn.RMSNorm(self.context_dim)
         )
         init(self.global_feat_proj[0], nonlinearity="linear")
+
+        # Hidden state init
+        self.init_hidden_state = nn.Parameter(torch.randn(1, 1, self.hidden_dim) / math.sqrt(self.hidden_dim))
 
         # Last predictions encoding
         kin_dim = 64
@@ -105,7 +109,13 @@ class QLOT(nn.Module):
         init(self.kin_encoder[0], nonlinearity="relu")
         init(self.kin_encoder[2], nonlinearity="linear")
 
-        self.context_w = nn.Parameter(torch.tensor([0.1, 0.025]))
+        # Hidden state proj
+        self.hidden_state_proj = nn.Linear(self.hidden_dim, self.context_dim)
+        init(self.hidden_state_proj, nonlinearity="linear")
+
+        self.context_fusion_weights = nn.Parameter(
+            torch.tensor([0.1, 0.025, 0.01])  # global features  # kin features  # hidden state
+        )
 
         # Local patch sampling
         self.sampler = LocalPatchSampler(
@@ -128,7 +138,7 @@ class QLOT(nn.Module):
             rank=8,
             heads=4,
             hidden_dim=128,
-            enable_spread=False,
+            enable_spread=True,
         )
 
         self.gate_proj = nn.Linear(self.hidden_dim, 2 * self.hidden_dim)
@@ -258,7 +268,7 @@ class QLOT(nn.Module):
         Args:
             batch_size (int): Number of samples in the batch.
             num_queries (int): Number of query points per sample.
-            query_points (torch.Tensor): Initial query points of shape (batch_size, num_queries, 2).
+            query_points (torch.Tensor): Initial query points of shape (batch_size, num_queries, 3).
             image_size (tuple[int, int]): Size of the image (height, width).
 
         Returns:
@@ -266,11 +276,15 @@ class QLOT(nn.Module):
         """
 
         device = self.init_hidden_state.device
+
+        # Flip y and z axes to match image coordinates
+        query_points = query_points * self.queries_transform
+
         # Initialize to center with unit variance,
         # since we are in normalized coordinates [-1, 1], center is 0.0
         # and variance 1 corresponds to exp(0)=1 in Cholesky params which is
         # (half_width, half_height) in pixel space.
-        coords = query_points[..., :2].clone().contiguous()
+        coords = query_points[..., :2].contiguous()
         if self.training:
             center = coords.mean(dim=1, keepdim=True)
             rel_xy = coords - center
@@ -293,9 +307,9 @@ class QLOT(nn.Module):
 
     def forward_image(
         self,
-        image: torch.Tensor,
-        query_points: torch.Tensor,
-        landmarks_to_mask: torch.Tensor | None = None,
+        image: Tensor,
+        query_points: Tensor,
+        landmarks_to_mask: Tensor | None = None,
     ) -> ImageFeatures:
         device = image.device
         batch_size, num_queries, _ = query_points.shape
@@ -314,19 +328,18 @@ class QLOT(nn.Module):
         query_points = query_points * self.queries_transform
 
         # Extract image features
-        image_feature_maps: list[torch.Tensor]  # Shape: list of (batch_size, C_i, H_i, W_i) for level i
-        context_feat: torch.Tensor  # Shape: (batch_size, context_dim)
-        image_feature_maps, context_feat = self.feature_extractor(image)
+        image_feature_maps: list[Tensor]  # Shape: list of (batch_size, C_i, H_i, W_i) for level i
+        global_feat: Tensor  # Shape: (batch_size, global_feat_dim)
+        image_feature_maps, global_feat = self.feature_extractor(image)
 
-        query_pre_enc = self.query_encoder(query_points)  # Shape: (batch_size, num_queries, query_pre_enc_dim)
-        query_enc: torch.Tensor = self.query_enc_mlp(query_pre_enc)  # Shape: (batch_size, num_queries, 256)
-        query_enc, query_enc_ctx = query_enc.split(
-            (self.query_enc_dim, self.context_dim), dim=-1
-        )  # query_enc_ctx: (batch_size, num_queries, context_dim), query_enc: (batch_size, num_queries, query_enc_dim)
+        query_enc: Tensor = self.query_encoder(query_points)  # Shape: (batch_size, num_queries, query_pre_enc_dim)
+        context_feat: Tensor = self.query_mlp(query_enc)  # Shape: (batch_size, num_queries, context_dim)
+        query_enc = self.query_proj(query_enc)  # Shape: (batch_size, num_queries, query_enc_dim)
 
-        context_feat = self.global_feat_proj(context_feat)
-        context_feat = context_feat.unsqueeze(1).expand(batch_size, num_queries, -1)  # (batch_size, num_queries, context_dim)
-        context_feat = query_enc_ctx + self.context_w[0] * context_feat  # Fuse with query encoding
+        global_feat = self.context_fusion_weights[0] * self.global_feat_proj(global_feat)
+        global_feat = global_feat.unsqueeze(1).expand(batch_size, num_queries, -1)  # (batch_size, num_queries, context_dim)
+
+        context_feat = context_feat + global_feat
 
         return ImageFeatures(maps=image_feature_maps, query_enc=query_enc, context_feat=context_feat, attn_mask=attn_mask)
 
@@ -345,25 +358,28 @@ class QLOT(nn.Module):
 
         # Process context features
         kin_enc = self.kin_encoder(torch.cat([last_coords, Cov(last_cov).as_bounded_params(), last_delta * 10.0], dim=-1))
-        curr_context = feat.context_feat + self.context_w[1] * kin_enc
+        context_feat = feat.context_feat + self.context_fusion_weights[1] * kin_enc
+
+        # Fuse hidden state with context features
+        normed_hidden_state = self.hidden_norm(last_hidden)  # (batch_size, num_queries, hidden_dim)
+        context_feat = context_feat + self.context_fusion_weights[2] * self.hidden_state_proj(normed_hidden_state)
 
         # Lookup local features at each coord
         warped_features = self.sampler(
-            coords=last_coords, feature_maps=feat.maps, context=curr_context
+            coords=last_coords, feature_maps=feat.maps, context=context_feat
         )  # Shape: list of (batch_size, num_queries, C_i)
         vis_feat = torch.cat([f for t in warped_features for f in t], dim=-1)  # (batch_size, num_queries, total_map_feat)
 
-        normed_hidden_state = self.hidden_norm(last_hidden)  # (batch_size, num_queries, hidden_dim)
         read_feat = torch.cat(
             [normed_hidden_state, feat.query_enc], dim=-1
         )  # (batch_size, num_queries, hidden_dim + query_enc_dim)
 
-        map_feat = torch.cat([vis_feat, curr_context], dim=-1)
+        map_feat = torch.cat([vis_feat, context_feat], dim=-1)
         map_feat = self.vision_feat_mlp(map_feat)
 
         # Mix features
         mixed = self.mixer(
-            write_feat=curr_context,
+            write_feat=context_feat,
             read_feat=read_feat,
             value_feat=map_feat,
             key_padding_mask=feat.attn_mask,
@@ -377,8 +393,8 @@ class QLOT(nn.Module):
 
         # Update hidden_state
         next_hidden: torch.Tensor = self.gru(
-            hidden_state=last_hidden,
-            hidden_state_in=normed_hidden_state,
+            prev_hidden=last_hidden,
+            prev_hidden_candidate=normed_hidden_state,
             candidate=candidate_feat,
             update=update,
             reset=reset,

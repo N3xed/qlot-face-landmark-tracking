@@ -30,7 +30,7 @@ class LocalPatchSampler(nn.Module):
             if isinstance(c, nn.Linear):
                 init(c, nonlinearity="linear")
 
-        chan_mult = 2
+        chan_mult = 4
         kernel_size = 4
         self.corr_conv = nn.ModuleList(
             [
@@ -83,7 +83,6 @@ class LocalPatchSampler(nn.Module):
             probs = corr.softmax(dim=-1)  # (batch_size, num_queries, H, res_sq)
             feat = sample @ probs[..., None]  # (batch_size, num_queries, H, C_i//H, 1)
             feat = feat.flatten(-3)  # (batch_size, num_queries, C_i)
-            feat = F.rms_norm(feat, (self.map_channels[i],))
 
             corr = corr.view(batch_size * num_queries, self.attn_heads, res, res)
             corr = self.corr_conv[i](corr)  # (batch_size * num_queries, 8, res_h', res_w')

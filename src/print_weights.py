@@ -21,28 +21,23 @@ def _branch_weights(logits: torch.Tensor) -> torch.Tensor:
     return logits.softmax(dim=0) * logits.numel()
 
 
-def _print_attn_temps(model: QLOT) -> None:
-    attn = model.update_predictor.mixer
+def _print_weights(model: QLOT) -> None:
+    attn = model.mixer
+
+    print("Model")
+    print(f"  context_w {_format_tensor(model.context_fusion_weights.detach())}")
     
-    print("Bypass Attention")
+    print("Mixer")
     # print(f"  gate-bias-raw {_format_tensor(attn.local_gate[-2].bias.detach(), flatten=False)}")  # type: ignore
     # print(f"  gate-bias {_format_tensor(attn.local_gate[-2].bias.sigmoid().detach(), flatten=False)}")  # type: ignore
     # print(f"  mix-gate-raw {_format_tensor(attn.mix_gate[0, :, 0, :].detach(), flatten=False)}")  # type: ignore
     # print(f"  mix-gate {_format_tensor(attn.mix_gate[0, :, 0, :].sigmoid().detach(), flatten=False)}")  # type: ignore
-    print(f"  write-temp-raw {_format_tensor(attn.write_temperature[0, 0].detach(), False)}")
-    print(f"  write-temp {_format_tensor((attn.write_temperature / 3.0).exp2()[0, 0].detach(), False)}")
+    print(f"  write-temp-raw {_format_tensor(attn.wr_temperature[0, 0].detach(), False)}")
+    print(f"  write-temp {_format_tensor((attn.wr_temperature / 3.0).exp2()[0, 0].detach(), False)}")
     print(f"  weight-residual {_format_tensor(attn.residual_weights[0].detach())}")
     print(f"  weight-hidden {_format_tensor(attn.residual_weights[1].detach())}")
     print(f"  weight-attn {_format_tensor(attn.residual_weights[2].detach())}")
     print(f"  weight-mlp {_format_tensor(attn.residual_weights[3].detach())}")
-
-def _print_feature_encoder_weights(model: QLOT) -> None:
-    encoder = model.encoder
-
-    print("Feature Encoder")
-    for i, branch in enumerate(encoder.corr_feat_head_convs):
-        print(f"  branch {i} softshrink temp {_format_tensor(branch[0].log_temp.detach().exp())}")  # type: ignore
-
 
 def _load_model(checkpoint_path: Path | None) -> QLOT:
     model = QLOT(feature_extractor_pretrained=False)
@@ -57,7 +52,7 @@ def _load_model(checkpoint_path: Path | None) -> QLOT:
             raise ValueError(f"No model state dict found in {checkpoint_path}")
     else:
         state_dict = checkpoint
-    state_dict = QLOT.translate_weights(state_dict)
+    # state_dict = QLOT.translate_weights(state_dict)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -90,9 +85,7 @@ def main() -> None:
     model = _load_model(args.checkpoint)
 
     if not args.list_parameters and not args.print_summary:
-        _print_attn_temps(model)
-        print()
-        _print_feature_encoder_weights(model)
+        _print_weights(model)
 
     if args.list_parameters:
         print()

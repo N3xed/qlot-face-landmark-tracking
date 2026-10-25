@@ -168,13 +168,14 @@ class HeadedLinear(nn.Module):
         nn.init.normal_(self.weight, std=std)
 
     def init_glu(self) -> None:
-        # Kaiming normal init
+        # Kaiming normal init (fan_in = in_dim)
         in_dim = self.weight.shape[1]
-        half_in_dim = in_dim // 2
+        out_dim = self.weight.shape[2]
+        half_out_dim = out_dim // 2
         std = 1.0 / math.sqrt(in_dim)
         nn.init.normal_(self.weight, std=std)
         with torch.no_grad():
-            self.weight[:, half_in_dim:] *= 0.1  # Scale down the GLU gate
+            self.weight[:, :, half_out_dim:] *= 0.1  # Scale down the GLU gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -289,12 +290,12 @@ class LowRankWriteReadMixer(nn.Module):
         # instead of 4 (spread, read, attn, mlp).
         residual_count = 4 if enable_spread else 3
         self.residual_weights = nn.Parameter(
-            torch.randn((residual_count, 1, heads, 1, 1)) * 0.025
+            torch.full((residual_count, 1, heads, 1, 1), 0.025)
         )  # (1, H, 1, 1) for broadcasting across (B, H, R, D)
 
         if enable_spread:
             self.basis_spread_proj = nn.Sequential(
-                HeadedLinear(self.head_dim + 1, 2 * self.head_dim, heads, head_dim=-3, init_out_dim=self.head_dim),
+                HeadedLinear(self.head_dim, 2 * self.head_dim, heads, head_dim=-3, init_out_dim=self.head_dim),
                 nn.GLU(),
             )
             self.basis_spread_proj[0].init_glu()  # type: ignore
@@ -442,9 +443,6 @@ class LowRankWriteReadMixer(nn.Module):
             basis_spread = basis_spread / second_moment_mean_rms  # (B, H, R, D)
             # With the nice identity: Σ basis^2 + basis_residual^2 = D.
 
-            # Include the absolute scale, so the model can use it.
-            basis_spread = torch.concat([basis_spread, second_moment_mean_rms], dim=-1)  # (B, H, R, D + 1)
-
             # Condition basis slots with spread information.
             residual_w = self.residual_weights  # (3, 1, H, 1, 1)
             basis = basis + residual_w[0] * self.basis_spread_proj(basis_spread)  # (B, H, R, D)
@@ -509,15 +507,15 @@ class GRU(nn.Module):
 
     def forward(
         self,
-        hidden_state: torch.Tensor,
-        hidden_state_in: torch.Tensor,
+        prev_hidden: torch.Tensor,
+        prev_hidden_candidate: torch.Tensor,
         candidate: torch.Tensor,
         update: torch.Tensor,
         reset: torch.Tensor,
     ) -> torch.Tensor:
-        candidate = torch.tanh(reset * self.hidden_proj(hidden_state_in) + candidate)
+        candidate = torch.tanh(reset * self.hidden_proj(prev_hidden_candidate) + candidate)
         if torch.compiler.is_exporting():
-            next_hidden = (1.0 - update) * hidden_state + update * candidate  # (B, N, hidden_dim)
+            next_hidden = (1.0 - update) * prev_hidden + update * candidate  # (B, N, hidden_dim)
         else:
-            next_hidden = torch.lerp(hidden_state, candidate, update)  # (B, N, hidden_dim)
+            next_hidden = torch.lerp(prev_hidden, candidate, update)  # (B, N, hidden_dim)
         return next_hidden

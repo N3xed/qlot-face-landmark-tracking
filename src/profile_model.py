@@ -236,12 +236,14 @@ class PyTorchProfiler:
             ],
             "Query Encoding": [
                 "model.query_encoder",
-                "model.query_enc_mlp",
+                "model.query_mlp",
+                "model.query_proj"
             ],
             "Local Sampling": ["model.sampler"],
             "Context Encoding": [
                 "model.kin_encoder",
                 "model.hidden_norm",
+                "model.hidden_state_proj"
             ],
             "Update Predictor": [
                 "model.vision_feat_mlp",
